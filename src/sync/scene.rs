@@ -28,6 +28,8 @@ const RETRY_EVERY_MS: f64 = 250.0;
 /// Bounds for walking the action scene (game memory).
 const MAX_GROUPS: usize = 0x10000;
 const MAX_ACTIONS: usize = 0x10000;
+/// Most peer cutscenes waiting to start here.
+const MAX_PENDING: usize = 64;
 
 /// Scene-action state changes logged per session (finding which action a cutscene is; nier_coop logged these too).
 static LOGGED: AtomicU32 = AtomicU32::new(0);
@@ -231,7 +233,12 @@ pub fn on_peer_play(id: u32, now: f64) {
     // Whether it already played here is decided in `tick`, against the action object loaded then.
     let mut s = shared();
     if !s.pending.iter().any(|&(p, _)| p == id) {
-        tracing::info!("cutscene sync: other player started {id:08x}; joining");
+        // Peer data: bounded, the oldest dropped first (and so is the log line per id).
+        if s.pending.len() >= MAX_PENDING {
+            s.pending.remove(0);
+        } else {
+            tracing::info!("cutscene sync: other player started {id:08x}; joining");
+        }
         s.pending.push((id, now));
     }
 }

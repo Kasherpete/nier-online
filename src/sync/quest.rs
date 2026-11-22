@@ -17,6 +17,8 @@ const CHECK_EVERY_MS: f64 = 1000.0;
 const RESEND_EVERY_MS: f64 = 3000.0;
 /// Lists in a row a state must be missing on the host before it is reset here.
 const RESET_AFTER: u32 = 3;
+/// Most states one host list may reset here.
+const MAX_RESETS: usize = 16;
 
 #[derive(Default)]
 struct Shared {
@@ -163,8 +165,17 @@ pub fn tick(now: f64) {
             tracing::info!("quest sync: + {n}");
         }
     }
-    let partial = t.len() * 2 < o.len();
-    let resets = debounce(&mut shared().missing, &del, partial);
+    // Resets lose story progress (and the game's next save keeps the loss), so only a host list that plausibly
+    // describes our own world may cause them: one sharing at least half of our shared states, at most
+    // `MAX_RESETS` per list.
+    let shared_ours = o.iter().filter(|n| !LOCAL_ONLY.iter().any(|p| n.starts_with(p))).count();
+    let overlap = shared_ours - del.len();
+    let partial = t.len() * 2 < o.len() || overlap * 2 < shared_ours;
+    let mut resets = debounce(&mut shared().missing, &del, partial);
+    if resets.len() > MAX_RESETS {
+        tracing::warn!("quest sync: host list would reset {} states; resetting only {MAX_RESETS}", resets.len());
+        resets.truncate(MAX_RESETS);
+    }
     for n in resets {
         if call(a.scene_reset, n) {
             tracing::info!("quest sync: - {n}");
