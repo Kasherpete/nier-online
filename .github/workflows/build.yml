@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the stable toolchain; rustup installs it on first use.
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/nier_online.dll dist/dinput8.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dinput8
+          path: dist/dinput8.dll
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dinput8.dll
