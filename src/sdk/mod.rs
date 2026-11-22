@@ -101,7 +101,9 @@ pub struct Pl0000 {
     pub facing2: f32,                // 0x0143C controller + 0x79C: stick direction
     _pad_01440: [u8; 0xEF24],        // 0x01440
     pub muteki_timer: f32,           // 0x10364 invincible while > 0 (Pl0000.setEventMuteki sets 300.0)
-    _pad_10368: [u8; 0x470],         // 0x10368
+    _pad_10368: [u8; 0x300],         // 0x10368
+    pub life: u32,                   // 0x10668 the real health: damage subtracts here, the update copies it to `health`
+    _pad_1066c: [u8; 0x16C],         // 0x1066C
     pub weapon_index: u32,           // 0x107D8 (AutomataMP genny)
     _pad_107dc: [u8; 0x44],          // 0x107DC
     pub pod_index: u32,              // 0x10820 active pod (index into pod_cooldown)
@@ -127,6 +129,7 @@ const _: () = {
     assert!(offset_of!(Pl0000, speed) == 0x1434);
     assert!(offset_of!(Pl0000, facing2) == 0x143C);
     assert!(offset_of!(Pl0000, muteki_timer) == 0x10364);
+    assert!(offset_of!(Pl0000, life) == 0x10668);
     assert!(offset_of!(Pl0000, weapon_index) == 0x107D8);
     assert!(offset_of!(Pl0000, pod_index) == 0x10820);
     assert!(offset_of!(Pl0000, pod_aim) == 0x12800);
@@ -155,6 +158,10 @@ pub const ANIM_CRASHES: [u32; 4] = [27, 65, 104, 106];
 /// `start_animation` ids that the synced controller inputs already cause (light attack, dash). Replaying
 /// them as well would start the move twice.
 pub const ANIM_FROM_INPUT: [u32; 2] = [16, 18];
+/// Player death state. A kill area does `life = health = 0; start_animation(ANIM_DEATH, 0, 0, 1)` (nier_coop
+/// `notes/death-and-warp.md`; the code is checked by `addr::patterns::KILL_AREA`). Never replayed on the remote
+/// player: her death would fail the mission (shared death uses `Event::PlayerDied` instead).
+pub const ANIM_DEATH: u32 = 0x35;
 /// Animation the spawned partner's buddy AI starts every idle frame; dropped for the remote player.
 pub const ANIM_PARTNER_WAIT: u32 = 1_000_000;
 /// `EmBase` die states: its die routine (vtable slot 170, what `EmBase.setDieRtn` calls) starts 0xAC, or 0xA9
@@ -164,6 +171,12 @@ pub const EM_DIE_STATES: [u32; 2] = [0xA9, 0xAC];
 
 /// Vtable slot of `Behavior::start_animation(this, anim, variant, a3, a4)` (AutomataMP `Behavior.hpp`).
 pub const START_ANIMATION_INDEX: usize = 18;
+
+/// The two per-frame update slots of `Behavior` (`fn(this)`; both count timers down by the entity's frame
+/// time). In `EmBase` (build 7788) slot 7 is 0x6009f0, which runs the AI through slot 202 (0x58c560); slot 8
+/// is 0x688dd0. Every enemy class overrides slot 7, and most call 0x6009f0 from their own. Slot 5 is the
+/// per-entity setup, not an update. See `notes/2026-11-22-enemy-targeting-reversing.md`.
+pub const UPDATE_SLOTS: [usize; 2] = [7, 8];
 
 /// Entity container (prefix; the real object is larger). `behavior` points at the `Behavior` subclass.
 #[repr(C)]
@@ -303,6 +316,58 @@ pub struct CameraData {
     pub view: [[f32; 4]; 4],      // 0xC0
 }
 const _: () = assert!(size_of::<CameraData>() == 0x100 && offset_of!(CameraData, view) == 0xC0);
+
+/// Scene action (`hap::Action`, prefix): cutscenes (`PhaseEventAction`), triggers and quest steps placed in the
+/// layout. nier_coop `sdk::SceneAction`.
+#[repr(C)]
+pub struct SceneAction {
+    pub vtable: usize,    // 0x00
+    _unknown: [u8; 0x10], // 0x08
+    pub id: u32,          // 0x18 layout id (the same in both games)
+    pub flags: u32,       // 0x1C
+    pub state: u32,       // 0x20 state name hash
+    _pad_24: u32,         // 0x24
+}
+const _: () = assert!(size_of::<SceneAction>() == 0x28 && offset_of!(SceneAction, state) == 0x20);
+
+/// A group of scene actions (prefix). nier_coop `sdk::ActionGroup`.
+#[repr(C)]
+pub struct ActionGroup {
+    _unknown: [u8; 0x30],                 // 0x00
+    pub actions: *const *mut SceneAction, // 0x30
+    pub count: usize,                     // 0x38
+}
+const _: () = assert!(size_of::<ActionGroup>() == 0x40);
+
+/// Static object holding every loaded action group (prefix). nier_coop `sdk::ActionScene`.
+#[repr(C)]
+pub struct ActionScene {
+    _unknown: [u8; 0x48],                  // 0x00
+    pub groups: *const *const ActionGroup, // 0x48
+    pub count: usize,                      // 0x50
+}
+const _: () = assert!(size_of::<ActionScene>() == 0x58);
+
+/// Argument of `Action::request_state`, built by the engine from a state hash. nier_coop `hooks::events`.
+#[repr(C)]
+pub struct StateReq {
+    pub hash: u32,       // 0x00 target state name hash
+    _pad_04: u32,        // 0x04
+    pub name: usize,     // 0x08 interned name, or 0
+    pub flag: u32,       // 0x10
+    _pad_14: u32,        // 0x14
+}
+const _: () = assert!(size_of::<StateReq>() == 0x18);
+
+/// `PhaseEventAction` state hashes (names from the game's state registry; nier_coop `hooks::events`).
+pub mod phase {
+    /// Play was requested (between LOADED and PLAYING).
+    pub const PLAY_REQ: u32 = 0xa09a3421;
+    pub const PLAYING: u32 = 0xecbccdf8;
+    /// Reached the last frames, holding.
+    pub const PLAY_END: u32 = 0xcee3b8c9;
+    pub const DONE: u32 = 0x26b80d1f;
+}
 
 /// CRC-32 (IEEE), the hash the engine keys script functions by.
 pub fn crc32(s: &[u8]) -> u32 {

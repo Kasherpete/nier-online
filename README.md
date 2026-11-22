@@ -41,22 +41,37 @@ cutscenes, and the other player's game follows along.
 ## Installing
 
 1. Download `nier-online.zip` from the [latest build](https://github.com/Kasherpete/nier-online/releases/tag/latest).
-2. Unzip it, right-click `install.ps1` and pick **Run with PowerShell**. It finds the game folder in your Steam
-   libraries and copies `dinput8.dll` next to `NieRAutomata.exe` (a `dinput8.dll` from another mod is kept as
-   `dinput8.dll.bak`). Or copy `dinput8.dll` there yourself.
-3. Start the game and press **Insert** to open the menu.
+2. Go to your Downloads folder, right click on the `nier-online.zip` you just downloaded, and click "Extract All..."
+3. Once you're inside of the `nier-online` folder, you should see `dinput8.dll` and `install.ps1`. Right click anywhere in the empty space below them, and click "Open in Terminal".
+4. Run both of the following commands:
+
+```
+powershell -ExecutionPolicy Bypass -File install.ps1
+
+.\install.ps1
+```
+
+3. If the command was successful, you should see it say `Installed nier-online to [path]`. Run the game, and press the **Insert** button on your keyboard.
 4. Host: click **Host**, then **Copy join code**, and send the code to your friend.
    Client: paste the code and click **Join**.
+
+**If the `.\install.ps1` command was unsuccessful,** you can copy and paste the `dinput8.dll` file directly to the game directory (it should be `C:\Program Files (x86)\Steam\steamapps\common\NieRAutomata`). Also feel free to file a report in Github issues.
 
 To uninstall, run `install.ps1 -Uninstall` or delete `dinput8.dll` from the game folder. If the game is not
 found, pass its folder: `install.ps1 -GameDir "D:\Games\Steam\steamapps\common\NieRAutomata"`.
 
-If PowerShell refuses to run the script (*"running scripts is disabled on this system"*, or a security
-warning because it was downloaded), run it once with
-`powershell -ExecutionPolicy Bypass -File install.ps1` from the unzipped folder.
+### Testing locally
 
-**Testing alone:** the **Mirror test** button makes a copy of you follow 2 m to the side, driven by the same
-code that drives a real second player.
+If you don't have anyone to play with or want to test co-op features on your own device, you have two options:
+
+#### 2B mirror
+
+The **Mirror test** button in the nier-online menu makes a copy of you follow 2 m to the side, driven by the same
+code that drives a real second player. This on its own isn't very useful though, it only helps test player sync and movement.
+
+#### Two game instances
+
+You can also run two instances of NieR:Automata at the same time. To do this, clone the repository, navigate to the `nier-online\tools\two-instances\` directory, and run `.\launch-two.ps1`. Both games will have the mod installed.
 
 ## Enemies and bosses
 
@@ -100,6 +115,8 @@ Third-party notices are in [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).
   enemies with the host's while blocking their AI.
 - [praydog/AutomataMP](https://github.com/praydog/AutomataMP) (MIT): original offsets and patterns, the
   host-owned enemy sync design, the ImGui overlay approach, and the reversed engine structures.
+
+**v0.3.0:** The host can now select which world to share, deaths and major cutscenes are shared (the players are teleported together when a cutscene starts), client attempts reconnection when the connection drops, added chat window, enemy targetting bugs fixed 
 
 **0.2.1:** Fixed mouse being reset to center while in nier-online ImGui menu, minor enhancements
 

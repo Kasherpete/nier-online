@@ -149,7 +149,7 @@ Use the latest stable version of each crate at the time it is added, and pin it 
 > sync and the name tag work. Phase 6 was reworked on 2026-11-22 (pairing, AI blocking, animation replay,
 > host-driven deaths; see `notes/2026-11-22-enemy-sync-reversing.md`). In-game, enemies now appear on the
 > client and stay in sync. Enemy sync and animation replay are on by default. Every address resolves against
-> the build 7788 exe; the log should say "all 18 addresses resolved". Next step: the rest of the Phase 6
+> the build 7788 exe; the log should say "all 28 addresses resolved". Next step: the rest of the Phase 6
 > checks (deaths, damage, enemy attacks on the client, bosses, disconnect).
 
 - [x] Cargo `cdylib` crate `nier_online`, edition 2024, stable pinned, target `x86_64-pc-windows-msvc`.
@@ -205,8 +205,9 @@ procedure for input (`WindowsMessageHook.cpp`). In Rust, `hudhook` does both.
 
 Implemented in `src/net/`. Notes: messages are split into `Datagram` and `Event` enums (one per channel).
 The LAN shortcut is covered by the join code, which carries the host's direct addresses; a bare `IP:port`
-join is not possible because iroh dials by public key. No automatic reconnect yet: after a drop, join again.
-The bulk-transfer stream is not opened until Phase 8 needs it.
+join is not possible because iroh dials by public key. After a drop the host keeps hosting with the same code and
+the client reconnects for 90 s. Save files go over their own unidirectional streams (`net/save.rs`), one per
+transfer, so they never block events.
 
 Goal: no port forwarding, no Tailscale, no dedicated server. `iroh` gives each player a key-based endpoint
 ID. It connects directly through UDP hole punching when it can, and through a relay server when it can't
@@ -229,7 +230,8 @@ ID. It connects directly through UDP hole punching when it can, and through a re
 - [x] `net/protocol.rs`: one `enum Message` with serde + postcard, and one decode function that enforces
       rule 4. Unit-test round trips and rejection of bad input.
 - [ ] Timeout and reconnect: when the peer drops, restore single-player behavior (buddy AI back on, enemy
-      spawning resumes on the client).
+      spawning resumes on the client). Written (2026-11-22), not yet verified in-game: the host re-accepts on
+      the same code, the client retries for 90 s (`net/mod.rs` `host` and `join`).
 - [ ] Keep the design to two players (host + one client). Give every entity a network ID, so more players
       could be added later without changing the protocol shape.
 
@@ -307,6 +309,15 @@ spawns or deletes where it can't.
       the client's backing enemies (aimed at where the client stands, since the host's enemy was attacking the
       puppet there). If attack hitboxes turn out not to follow the animation, add `PlayerHit { damage,
       knockback }` from the host's hits on the puppet.
+- [ ] **Aggro follows the client too.** Seen in-game (2026-11-22): when the host is away from an enemy, the
+      enemy stays passive on both sides, even with the client standing next to it, until the client hits it.
+      Cause: enemy AI gets "the player" only from three getters that read the possessed handle. Written
+      (2026-11-22), not yet verified in-game: `src/sync/aggro.rs` wraps every enemy class's update slots (7, 8)
+      and, during an enemy's update on the host, has the getters return the client's puppet when it is the
+      nearer player (3 m hysteresis). Bosses are covered (they are EmBase classes); boss parts are not. Setting
+      `enemy_target_client`; the host's overlay shows how many enemies target the client. Reversing:
+      `notes/2026-11-22-enemy-targeting-reversing.md`. If enemies still ignore the client, an area trigger
+      tied to the possessed character may also gate aggro (see the notes' open questions).
 - [ ] **Late join / reconnect:** on connect, the host sends `SpawnEntity` for every live networked entity.
 - [ ] Networked classes: `EmBase` (enemies and bosses) and `BaAnimal`; everything else stays local (boss parts,
       NPCs, hacking enemies, effects, bullets). The check is `ClassInfo::is_networkable` in `sync/world.rs`.
@@ -337,14 +348,31 @@ matched build 7788, but re-resolve every one.
 
 - [ ] **Save sync at startup:** the client holds the game's first save read until the host's save arrives,
       writes it to a separate slot, and loads it, so both games start from identical progress. Never
-      overwrite the client's own saves.
+      overwrite the client's own saves. Written (2026-11-22), not yet verified in-game: the host sends its
+      newest slot on connect and whenever it changes (`net/save.rs`); the client keeps it in
+      `<game>\nier_online\host_save.dat` (outside the Steam-Cloud save folder). `hooks/savefile.rs` detours
+      CreateFileA / DeleteFileA: while connected as client, slot reads come from the host's save and the other
+      slots look empty, slot writes go to a discard file, deletes do nothing. The menu's "Join"
+      holds the first save read for the host's save, or restarts the game into it if the list was already read.
+      Reversing: `notes/2026-11-22-save-files-reversing.md`. Open: whether a Load Game re-reads the file (expected
+      from the code; if not, use the restart). "Host" first asks which save slot to share (or "new game": the
+      newest save once there is one); the host sends that slot from the moment a client connects, so it does
+      not have to be in that world yet, and warns when it plays a different slot. The
+      client's copy has its player name (UTF-16 at 0x34..0x7C, the only text in the slot header) prefixed with
+      "[online] " (setting `online_save_label`). Open: whether the save list shows that name.
 - [ ] **Quest flags:** hook quest set/reset on the host and replay them on the client. The client never
       sets quest flags from its own gameplay.
 - [ ] **Cutscenes and scripted events:** relay phase / subphase signals and objective updates from the host.
       Both players watch the cutscene; neither can play until both finish (or the host skips).
+      Cutscene part written (2026-11-22), not yet verified in-game: `src/sync/events.rs` hooks
+      `Action::request_state`. Either player's cutscene start sends `Event::Cutscene { id, pos }`; the other warps
+      there (`Pl0000::warp`) and plays its own `PhaseEventAction` with that id. Setting `cutscene_sync`. Signals,
+      objectives and enemy-set spawns (the rest of nier_coop `hooks/events.rs`) are not ported yet.
 - [ ] **Items and money:** decide shared vs. per-player loot. Start with "each player keeps their own pickups".
-- [ ] Death and game over: if the host dies, both reload the host's checkpoint. If the client dies, respawn
-      them next to the host instead of failing the mission.
+- [ ] Death and game over: when either player dies, the other dies too (`Event::PlayerDied`; the kill-area
+      death), so both reload their last checkpoint; after a client death the client warps to the host if they
+      respawned more than 30 m apart. Written (2026-11-22), not yet verified in-game: `src/sync/events.rs`,
+      setting `shared_death`.
 
 ## Phase 9: Special gameplay modes
 
@@ -364,9 +392,13 @@ reverse it live.
 
 ## Phase 10: Polish and release
 
-- [ ] Text chat in the overlay (an open feature request on AutomataMP).
-- [ ] Connection quality display: ping, packet loss, relay vs. direct.
+- [ ] Text chat in the overlay (an open feature request on AutomataMP). Written (2026-11-22), not yet
+      verified in-game: the menu's Chat tab, plus a chat box in the bottom left (`src/ui/chat.rs`). `/` opens
+      it, Enter sends, Escape (or `/` on an empty line) closes it. While it is closed, new lines show for 8 s.
+- [ ] Connection quality display: ping, packet loss, relay vs. direct. Written (2026-11-22): loss from iroh's
+      sent/lost packet counters, smoothed, in the Connection tab.
 - [ ] Crash handler that writes a minidump and the last log lines (AutomataMP `ExceptionHandler.cpp`).
+      Written (2026-11-22): `src/crash.rs`, files in `<game>\nier_online\crash-<time>.dmp/.log`.
 - [ ] Compatibility check with common mods such as FAR (Fix Automata Resolution), which also hook DX11.
 - [ ] GitHub Actions: build on every push, attach `dinput8.dll` to tagged releases. Written: every push to
       `main` replaces the `latest` pre-release (`nier-online.zip` with `dinput8.dll` and `install.ps1`), and

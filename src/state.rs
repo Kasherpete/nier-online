@@ -145,7 +145,9 @@ pub enum GameCommand {
 /// Commands from the overlay to the net thread.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NetCommand {
-    Host,
+    /// Host, sharing this save slot (None: the newest save, once there is one; a new game).
+    Host(Option<u32>),
+    /// Join a host and play in its world (see `hooks::savefile`); retries for a while.
     Join(String),
     /// Mirror test: echo our own state back, shifted 2 m sideways.
     Loopback,
@@ -206,9 +208,13 @@ pub struct NetStatus {
     pub rtt_ms: Option<f32>,
     /// "direct" or "relay".
     pub path: Option<&'static str>,
+    /// Recent packet loss, percent.
+    pub loss_pct: Option<f32>,
     pub last_error: Option<String>,
     pub busy: bool,
     pub connected: bool,
+    /// Client: the join code of this session (for "Restart into host's world").
+    pub joined_code: Option<String>,
 }
 
 pub static NET_STATUS: LazyLock<Mutex<NetStatus>> =
@@ -234,6 +240,8 @@ pub struct OverlayInfo {
     /// Enemy sync counters while a session syncs enemies.
     pub enemy: Option<EnemyStats>,
     pub game_ok: bool,
+    /// A character is loaded (in a world, not at the title or a loading screen).
+    pub local_player: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -270,6 +278,8 @@ pub struct EnemyStats {
     /// Client: backed enemies the host's recent snapshots did not include (they run on our own AI).
     pub no_updates: usize,
     pub replay_unverified: bool,
+    /// Host: enemies whose AI currently targets the client's character (the nearer player).
+    pub targeting_client: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -280,13 +290,21 @@ pub struct Inspect {
     pub rows: Vec<(usize, u32, f32)>,
 }
 
-/// Recent chat lines (sender: text), newest last. Written by the net thread, read by the overlay.
-pub static CHAT: LazyLock<Mutex<std::collections::VecDeque<String>>> =
+/// One chat line ("sender: text") and when it arrived ([`now_ms`]).
+#[derive(Clone, Debug)]
+pub struct ChatLine {
+    pub at_ms: f64,
+    pub text: String,
+}
+
+/// Recent chat lines, newest last. Written by the net thread (and the overlay for local notices), read by
+/// the overlay.
+pub static CHAT: LazyLock<Mutex<std::collections::VecDeque<ChatLine>>> =
     LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
 
 pub fn push_chat(line: String) {
     if let Ok(mut c) = CHAT.lock() {
-        c.push_back(line);
+        c.push_back(ChatLine { at_ms: now_ms(), text: line });
         while c.len() > 100 {
             c.pop_front();
         }
@@ -294,7 +312,7 @@ pub fn push_chat(line: String) {
 }
 
 pub static OVERLAY: LazyLock<Mutex<OverlayInfo>> = LazyLock::new(|| Mutex::new(OverlayInfo::default()));
-/// The overlay is open: game input is blocked (see `proxy`).
+/// The overlay menu or the chat box is open: game input is blocked (see `proxy`) and the cursor is free.
 pub static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// Overlay -> game: the debug panel wants the entity list (0 = no) and which handle to inspect.
 pub static DEBUG_LIST_WANTED: AtomicBool = AtomicBool::new(false);

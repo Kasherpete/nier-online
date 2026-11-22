@@ -6,6 +6,7 @@
 
 pub mod addr;
 pub mod config;
+pub mod crash;
 pub mod hooks;
 pub mod log;
 pub mod net;
@@ -70,6 +71,18 @@ fn worker(module: HINSTANCE) {
     let cfg = config::get();
     let log_file = log::init(&cfg.log_level);
     tracing::info!("nier-online {} (built {}) loaded, logging to {log_file}", net::MOD_VERSION, net::BUILT);
+    crash::install();
+    // First: the game reads its save list right after the startup logos. Needs no game addresses.
+    if let Err(e) = hooks::savefile::install() {
+        tracing::error!("save redirection not installed ({e}); save sync is off");
+    }
+    // A "Join" restart: hold the save list until the host's save is here, then join.
+    let autojoin = hooks::savefile::take_autojoin();
+    if autojoin.is_some() {
+        tracing::info!("joining the host's world (restarted for it)");
+        hooks::savefile::enter_host_world();
+        hooks::savefile::hold_next_read(true);
+    }
 
     let (bytes, base) = match live_image() {
         Ok(v) => v,
@@ -82,18 +95,23 @@ fn worker(module: HINSTANCE) {
     let (addresses, img) = match resolved {
         Ok(v) => v,
         Err(e) => {
+            hooks::savefile::hold_next_read(false);
             tracing::error!("address lookup failed: {e}");
             tracing::error!("The game was probably updated. No hooks were installed; the game runs unmodded.");
             return;
         }
     };
-    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, 18);
+    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, 28);
     let build = addresses.build;
     if let Err(e) = hooks::install(addresses, img) {
         // Hooks are installed in an order where a failure leaves the game consistent (the tick goes last).
         tracing::error!("hook install failed: {e}");
+        hooks::savefile::hold_next_read(false);
         return;
     }
     net::spawn(build);
+    if let Some(code) = autojoin {
+        let _ = state::Q.net_cmds.push(state::NetCommand::Join(code));
+    }
     ui::start(module);
 }

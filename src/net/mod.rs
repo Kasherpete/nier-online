@@ -8,6 +8,7 @@
 //! iroh connects directly through UDP hole punching when it can, and through a relay when it can't.
 
 pub mod protocol;
+pub mod save;
 pub mod ticket;
 
 use std::sync::atomic::Ordering::Relaxed;
@@ -33,6 +34,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Close the connection after this long without hearing from the peer (keep-alives included).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a client keeps trying to reach the host (a first join, a restart into its world, or after a drop).
+const RECONNECT_FOR: Duration = Duration::from_secs(90);
 
 /// Game build identifier sent in `Hello`; set at startup from the exe's PE timestamp.
 static GAME_BUILD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -100,7 +103,7 @@ async fn main_loop() {
                 cmd = loopback().await;
                 Ok(())
             }
-            NetCommand::Host | NetCommand::Join(_) => {
+            NetCommand::Host(_) | NetCommand::Join(_) => {
                 if ep.is_none() {
                     status(|s| {
                         s.state = "Starting network...".into();
@@ -116,8 +119,17 @@ async fn main_loop() {
                 }
                 let e = ep.as_ref().unwrap();
                 match c {
-                    NetCommand::Host => host(e).await.map(|next| cmd = next),
-                    NetCommand::Join(code) => join(e, &code).await.map(|next| cmd = next),
+                    NetCommand::Host(slot) => {
+                        save::set_shared(slot);
+                        tracing::info!("hosting; sharing {}", slot.map_or("the newest save (new game)".into(), |s| format!("slot {}", s + 1)));
+                        host(e).await.map(|next| cmd = next)
+                    }
+                    NetCommand::Join(code) => {
+                        let r = join(e, &code).await.map(|next| cmd = next);
+                        // Not joining any more: a held save read goes ahead with the saves we have.
+                        crate::hooks::savefile::hold_next_read(false);
+                        r
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -139,7 +151,7 @@ async fn host(ep: &Endpoint) -> Result<Option<NetCommand>, String> {
     let code = ticket::encode(&ep.addr());
     status(|s| {
         s.state = "Hosting: waiting for a player to join".into();
-        s.join_code = Some(code);
+        s.join_code = Some(code.clone());
         s.busy = false;
     });
     loop {
@@ -171,7 +183,23 @@ async fn host(ep: &Endpoint) -> Result<Option<NetCommand>, String> {
                 };
                 let r = session(conn, send, recv, Role::Host).await;
                 refuser.abort();
-                return r;
+                match r {
+                    Ok(next) => return Ok(next),
+                    Err(e) => {
+                        // The client dropped (or is restarting into this world): keep hosting with the same
+                        // code, so it can come back.
+                        end_session();
+                        tracing::warn!("client left ({e}); waiting for a player to join again");
+                        status(|s| {
+                            *s = state::NetStatus {
+                                state: "Hosting: waiting for a player to join".into(),
+                                join_code: Some(code.clone()),
+                                last_error: Some(format!("last session: {e}")),
+                                ..Default::default()
+                            };
+                        });
+                    }
+                }
             }
             c = next_command() => return match c {
                 NetCommand::Disconnect | NetCommand::Chat(_) => Ok(None),
@@ -181,25 +209,59 @@ async fn host(ep: &Endpoint) -> Result<Option<NetCommand>, String> {
     }
 }
 
+/// Connects to a host, retrying for up to `RECONNECT_FOR`: after a restart into the host's world the host may
+/// still be timing out the session of the game copy that just closed. After a session drops, it reconnects to
+/// the same code for that long too.
 async fn join(ep: &Endpoint, code: &str) -> Result<Option<NetCommand>, String> {
     let addr = ticket::decode(code)?;
-    status(|s| {
-        s.state = "Connecting...".into();
-        s.busy = true;
-    });
-    let conn = tokio::select! {
-        r = timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)) => match r {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("could not connect: {e}")),
-            Err(_) => return Err("could not connect: timed out".into()),
-        },
-        c = next_command() => return match c {
-            NetCommand::Disconnect | NetCommand::Chat(_) => Ok(None),
-            other => Ok(Some(other)),
-        },
-    };
-    let (send, recv) = conn.open_bi().await.map_err(|e| format!("could not open a stream: {e}"))?;
-    session(conn, send, recv, Role::Client).await
+    let mut retry_since = Some(Instant::now());
+    status(|s| s.joined_code = Some(code.trim().to_string()));
+    loop {
+        status(|s| {
+            s.state = if retry_since.is_some() { "Connecting (retrying)...".into() } else { "Connecting...".into() };
+            s.busy = true;
+        });
+        let attempt = tokio::select! {
+            r = timeout(CONNECT_TIMEOUT, ep.connect(addr.clone(), ALPN)) => match r {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(format!("could not connect: {e}")),
+                Err(_) => Err("could not connect: timed out".into()),
+            },
+            c = next_command() => return match c {
+                NetCommand::Disconnect | NetCommand::Chat(_) => Ok(None),
+                other => Ok(Some(other)),
+            },
+        };
+        let conn = match attempt {
+            Ok(c) => c,
+            Err(e) => match retry_since {
+                Some(t) if t.elapsed() < RECONNECT_FOR => {
+                    tracing::info!("{e}; retrying");
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(3)) => continue,
+                        c = next_command() => return match c {
+                            NetCommand::Disconnect | NetCommand::Chat(_) => Ok(None),
+                            other => Ok(Some(other)),
+                        },
+                    }
+                }
+                _ => return Err(e),
+            },
+        };
+        let (send, recv) = conn.open_bi().await.map_err(|e| format!("could not open a stream: {e}"))?;
+        let r = session(conn, send, recv, Role::Client).await;
+        // Role is set only after a good handshake: a refused or mismatched handshake is not retried.
+        let was_connected = state::role() != Role::None;
+        match r {
+            Err(e) if was_connected => {
+                end_session();
+                tracing::warn!("lost the host ({e}); reconnecting for up to {} s", RECONNECT_FOR.as_secs());
+                retry_since = Some(Instant::now());
+                status(|s| s.last_error = Some(format!("lost the host: {e}")));
+            }
+            other => return other,
+        }
+    }
 }
 
 async fn write_frame(send: &mut SendStream, e: &Event) -> Result<(), String> {
@@ -279,6 +341,9 @@ async fn handshake(send: &mut SendStream, recv: &mut RecvStream, role: Role) -> 
 }
 
 fn end_session() {
+    if state::role() == Role::Client {
+        crate::hooks::savefile::session_ended();
+    }
     if state::role() != Role::None {
         state::set_role(Role::None);
         state::ENEMY_SYNC.store(false, Relaxed);
@@ -326,6 +391,49 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
         s.busy = false;
         s.last_error = None;
     });
+
+    // Save sync: the client plays in the host's world while connected (`hooks::savefile`) and receives the
+    // host's save on its own streams; the host sends it below.
+    let dir = save::save_dir();
+    if dir.is_none() {
+        tracing::warn!("save sync: save folder (Documents\\My Games\\NieR_Automata) not found");
+    }
+    let saves_in = (role == Role::Client).then(|| {
+        crate::hooks::savefile::enter_host_world();
+        let (conn, dir) = (conn.clone(), dir.clone());
+        tokio::spawn(async move {
+            while let Ok(mut r) = conn.accept_uni().await {
+                let mut h = [0u8; save::HEADER];
+                if r.read_exact(&mut h).await.is_err() {
+                    continue;
+                }
+                let (slot, crc) = match save::parse_header(&h) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("save sync: rejected a transfer: {e}");
+                        continue;
+                    }
+                };
+                let mut data = vec![0u8; crate::hooks::savefile::SAVE_SIZE];
+                if let Err(e) = r.read_exact(&mut data).await {
+                    tracing::warn!("save sync: transfer cut off: {e}");
+                    continue;
+                }
+                match save::accept(slot, crc, data, dir.as_deref()) {
+                    Ok(()) => {
+                        tracing::info!("save sync: received the host's save (slot {})", slot + 1);
+                        state::push_chat(format!("[co-op] Received the host's save (slot {}).", slot + 1));
+                    }
+                    Err(e) => tracing::warn!("save sync: {e}"),
+                }
+            }
+        })
+    });
+    let mut last_save: Option<(u32, u32)> = None;
+    let mut last_save_check = Instant::now() - Duration::from_secs(10);
+    let mut save_out: Option<tokio::task::JoinHandle<()>> = None;
+    let session_start = Instant::now();
+    let mut no_save_noted = false;
 
     let peer_name = peer.name.clone();
     let mut events_in = tokio::spawn(async move {
@@ -381,6 +489,7 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
     let mut seq = 0u32;
     let mut send_errors = 0u32;
     let mut last_status = Instant::now();
+    let (mut last_counts, mut loss) = ((0u64, 0u64), 0.0f32);
     let result = loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -426,27 +535,78 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
                 NetCommand::Disconnect => {
                     conn.close(0u32.into(), b"bye");
                     datagrams_in.abort();
+                    for t in saves_in.iter().chain(save_out.iter()) {
+                        t.abort();
+                    }
                     events_in.abort();
                     return Ok(None);
                 }
                 other => {
                     conn.close(0u32.into(), b"bye");
                     datagrams_in.abort();
+                    for t in saves_in.iter().chain(save_out.iter()) {
+                        t.abort();
+                    }
                     events_in.abort();
                     return Ok(Some(other));
                 }
             }
         }
+        if role == Role::Client
+            && !no_save_noted
+            && session_start.elapsed() > Duration::from_secs(15)
+            && !crate::hooks::savefile::host_save().0
+        {
+            // A host on a new game that has not saved yet has nothing to send: don't hold the save list for it.
+            no_save_noted = true;
+            crate::hooks::savefile::hold_next_read(false);
+            tracing::warn!("save sync: no save from the host after 15 s");
+            state::push_chat("[co-op] The host has no save to send yet (a new game?). Once they save, use Restart into host's world.".into());
+        }
+        if role == Role::Host
+            && last_save_check.elapsed() > Duration::from_secs(1)
+            && save_out.as_ref().is_none_or(|t| t.is_finished())
+            && let Some(dir) = &dir
+        {
+            last_save_check = Instant::now();
+            if let Some((slot, crc, data)) = save::to_send(dir, save::shared().or(crate::hooks::savefile::loaded_slot()), last_save) {
+                last_save = Some((slot, crc));
+                tracing::info!("save sync: sending slot {} to the client", slot + 1);
+                let conn = conn.clone();
+                save_out = Some(tokio::spawn(async move {
+                    let r = async {
+                        let mut s = conn.open_uni().await.map_err(|e| e.to_string())?;
+                        s.write_all(&save::header(slot, crc, data.len())).await.map_err(|e| e.to_string())?;
+                        s.write_all(&data).await.map_err(|e| e.to_string())?;
+                        s.finish().map_err(|e| e.to_string())
+                    };
+                    if let Err(e) = r.await {
+                        tracing::warn!("save sync: sending failed: {e}");
+                    }
+                }));
+            }
+        }
         if last_status.elapsed() > Duration::from_millis(500) {
             last_status = Instant::now();
             let (rtt, path) = path_status(&conn);
+            // Packet loss over this window, smoothed (iroh counts QUIC packets sent and declared lost).
+            let st = conn.stats();
+            let (sent, lost) = (st.sent_packets.saturating_sub(last_counts.0), st.lost_packets.saturating_sub(last_counts.1));
+            last_counts = (st.sent_packets, st.lost_packets);
+            if sent > 0 {
+                loss = 0.8 * loss + 0.2 * (lost as f32 / sent as f32 * 100.0).min(100.0);
+            }
             status(|s| {
                 s.rtt_ms = rtt;
                 s.path = path;
+                s.loss_pct = Some(loss);
             });
         }
     };
     datagrams_in.abort();
+    for t in saves_in.iter().chain(save_out.iter()) {
+        t.abort();
+    }
     events_in.abort();
     conn.close(0u32.into(), b"bye");
     tracing::warn!("session ended: {}", result.as_ref().err().map_or("", |e| e.as_str()));

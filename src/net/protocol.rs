@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::sdk::{self, cVec4};
 
 /// Bumped on any change to the message shapes below. Both sides must match exactly.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// QUIC application protocol id. Kept at /1 across protocol versions, so a peer on another version still
 /// connects and gets the clear refusal from the `Hello` check instead of a bare connection error.
 pub const ALPN: &[u8] = b"nier-online/1";
@@ -109,6 +109,12 @@ pub enum Event {
     /// Host -> client: a host-owned entity was removed from the world.
     DestroyEntity { net_id: u32 },
     Chat { text: String },
+    /// The sender's character died by itself (not because of a `PlayerDied` it received): the receiver's
+    /// character dies too.
+    PlayerDied,
+    /// The sender's game started playing cutscene `id` (a `PhaseEventAction` layout id, the same in both games)
+    /// with the sender's character at `pos`. The receiver warps there and plays the same cutscene.
+    Cutscene { id: u32, pos: cVec4, rot: cVec4 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,13 +193,17 @@ pub fn decode_event(b: &[u8]) -> Result<Event, DecodeError> {
             check(args[0] < MAX_ANIM, "animation id out of range")?;
             check(!sdk::ANIM_CRASHES.contains(&args[0]), "animation id known to crash")?;
         }
-        Event::Buttons { .. } | Event::DestroyEntity { .. } | Event::EntityDied { .. } => {}
+        Event::Buttons { .. } | Event::DestroyEntity { .. } | Event::EntityDied { .. } | Event::PlayerDied => {}
         Event::EntityAnim { args, .. } => check(args[0] < MAX_ANIM, "entity animation id out of range")?,
         Event::SpawnEntity(s) => {
             check(!s.name.is_empty() && s.name.len() <= MAX_ENTITY_NAME && s.name.bytes().all(|b| b.is_ascii_graphic()), "bad entity name")?;
             check(s.pos.is_sane() && s.rot.is_sane(), "non-finite spawn transform")?;
         }
         Event::Chat { text } => check(short_text(text, MAX_CHAT), "bad chat text")?,
+        Event::Cutscene { id, pos, rot } => {
+            check(*id != 0, "cutscene id 0")?;
+            check(pos.is_sane() && rot.is_sane(), "non-finite cutscene position")?;
+        }
     }
     Ok(e)
 }
@@ -239,6 +249,8 @@ mod tests {
             Event::EntityAnim { net_id: 1, args: [0xAC, 0, 0, 0] },
             Event::EntityDied { net_id: 1 },
             Event::Chat { text: "hello".into() },
+            Event::PlayerDied,
+            Event::Cutscene { id: 0x1234_5678, pos: cVec4::new(1.0, 2.0, 3.0, 1.0), rot: cVec4::default() },
         ] {
             assert_eq!(decode_event(&encode(&e)), Ok(e));
         }
@@ -269,6 +281,8 @@ mod tests {
         assert!(matches!(decode_event(&encode(&name)), Err(DecodeError::Invalid(_))));
         let anim = Event::EntityAnim { net_id: 1, args: [MAX_ANIM, 0, 0, 0] };
         assert!(matches!(decode_event(&encode(&anim)), Err(DecodeError::Invalid(_))));
+        let cut = Event::Cutscene { id: 1, pos: cVec4::new(f32::INFINITY, 0.0, 0.0, 1.0), rot: cVec4::default() };
+        assert!(matches!(decode_event(&encode(&cut)), Err(DecodeError::Invalid(_))));
         let ctl = Event::Chat { text: "a\nb".into() };
         assert!(matches!(decode_event(&encode(&ctl)), Err(DecodeError::Invalid(_))));
         let long_name = Event::Hello(Hello { protocol: 1, mod_version: "x".into(), game_build: 0, name: "n".repeat(33), enemy_sync: false });

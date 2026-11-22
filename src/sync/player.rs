@@ -30,6 +30,8 @@ const MUTEKI: f32 = 300.0;
 // local player and remote player behaviors (0 = none), and the remote's inputs.
 static PLAYER: AtomicUsize = AtomicUsize::new(0);
 static REMOTE: AtomicUsize = AtomicUsize::new(0);
+/// The remote player's entity handle, published with `REMOTE` so hooks can check the pointer is still live.
+static REMOTE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static REMOTE_HELD: AtomicU32 = AtomicU32::new(0);
 static REMOTE_FIRING: AtomicBool = AtomicBool::new(false);
 static REMOTE_AIM: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
@@ -79,6 +81,7 @@ impl PlayerSync {
             self.spawned = 0;
         }
         REMOTE.store(0, Relaxed);
+        REMOTE_HANDLE.store(0, Relaxed);
         if !active {
             self.despawn(local);
             return;
@@ -87,6 +90,7 @@ impl PlayerSync {
             return; // keep her (invincible, standing) until the peer comes back or the session ends
         };
         let Some(b) = remote.or_else(|| self.try_spawn(now, local_handle, pl)) else { return };
+        REMOTE_HANDLE.store(self.spawned, Relaxed);
         REMOTE.store(b as usize, Relaxed);
         self.drive(b, now, dt);
     }
@@ -220,7 +224,9 @@ impl PlayerSync {
                     held |= buttons.iter().enumerate().filter(|(_, v)| **v != 0).fold(0, |h, (i, _)| h | 1 << i);
                 }
                 RemoteEvent::Anim(args) if in_pl => {
-                    if !sdk::ANIM_FROM_INPUT.contains(&args[0]) && !sdk::ANIM_CRASHES.contains(&args[0]) {
+                    // Not the death state: her death would fail the mission (shared death is `PlayerDied`).
+                    let a = args[0];
+                    if !sdk::ANIM_FROM_INPUT.contains(&a) && !sdk::ANIM_CRASHES.contains(&a) && a != sdk::ANIM_DEATH {
                         hooks::call_start_animation(b.cast(), args[0], args[1], args[2], args[3]);
                     }
                 }
@@ -358,4 +364,22 @@ pub fn is_remote(e: *mut Entity) -> bool {
     // SAFETY: entities from the live list.
     let b = unsafe { addr_of!((*e).behavior).read() } as usize;
     b != 0 && b == REMOTE.load(Relaxed)
+}
+
+/// For hooks on any game thread: the remote player this frame, if still alive (its handle still resolves
+/// to the same object). `(behavior, entity, handle)`.
+pub fn live_remote() -> Option<(*mut Pl0000, *mut Entity, u32)> {
+    let b = REMOTE.load(Relaxed);
+    let h = REMOTE_HANDLE.load(Relaxed);
+    let e = world::entity_by_handle(h)?;
+    // SAFETY: a live entity from the list; only its behavior pointer is read.
+    (b != 0 && unsafe { addr_of!((*e).behavior).read() } as usize == b).then_some((b as *mut Pl0000, e, h))
+}
+
+/// For hooks: the local player this frame, if still the possessed character.
+pub fn live_local() -> Option<*mut Pl0000> {
+    let b = PLAYER.load(Relaxed);
+    let e = world::entity_by_handle(world::possessed_handle())?;
+    // SAFETY: as in `live_remote`.
+    (b != 0 && unsafe { addr_of!((*e).behavior).read() } as usize == b).then_some(b as *mut Pl0000)
 }

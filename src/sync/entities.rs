@@ -561,11 +561,13 @@ impl EntitySync {
         self.last_send_ms = now;
         let mut items = Vec::with_capacity(self.owned.len());
         let mut gone = Vec::new();
+        let mut on_client = 0;
         for (&id, o) in &mut self.owned {
             let Some((b, _)) = networkable(o.handle) else {
                 gone.push(id);
                 continue;
             };
+            on_client += crate::sync::aggro::targets_client(b as usize) as usize;
             let (pos, hp, _) = read_state(b);
             // SAFETY: validated BehaviorAppBase.
             let rot = unsafe { addr_of!((*b).rotation).read() };
@@ -603,6 +605,7 @@ impl EntitySync {
             let _ = Q.out_datagrams.force_push(d);
         }
         self.stats.tracked = self.owned.values().filter(|o| !o.dead).count();
+        self.stats.targeting_client = on_client;
     }
 
     fn tick_client(&mut self, now: f64, dt: f32) {

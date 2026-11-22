@@ -1,6 +1,6 @@
 [package]
 name = "nier_online"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Peer-to-peer two-player co-op for NieR:Automata"
@@ -41,6 +41,11 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_DataExchange",
     "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_Storage_FileSystem",
 ]
 
 [profile.release]

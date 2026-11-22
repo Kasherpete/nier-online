@@ -228,6 +228,17 @@ pub fn assign_routine(e: *mut Entity, routine: &core::ffi::CStr) {
     }
 }
 
+/// Teleports a validated `Pl0000` with the engine's warp, which also moves its previous positions and
+/// collision body (writing `position` alone does not survive long jumps; nier_coop `notes/death-and-warp.md`).
+/// The engine skips it while the character is in state 0xD3.
+pub fn warp(pl: *mut Pl0000, pos: sdk::cVec4, rot: sdk::cVec4) {
+    let g = game();
+    type Warp = unsafe extern "system" fn(*mut Pl0000, *const sdk::cVec4, *const sdk::cVec4, u32, f32);
+    let pos = sdk::cVec4 { w: 1.0, ..pos };
+    // SAFETY: resolved function with this signature (callers in the engine pass 0 and 0.0); game thread.
+    unsafe { std::mem::transmute::<usize, Warp>(g.addr.abs(g.addr.warp))(pl, &pos, &rot, 0, 0.0) }
+}
+
 // -------------------------------------------------------------------------------------------------------
 // Fields
 

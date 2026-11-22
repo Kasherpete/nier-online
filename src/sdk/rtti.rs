@@ -77,18 +77,21 @@ pub fn find_vtable(img: &Image, class: &str) -> Result<usize> {
     Ok(meta + 8)
 }
 
-/// Every primary vtable in the image with its class chain (most-derived first). Slow: a full scan of the
-/// data sections, for offline tests.
-#[cfg(test)]
+/// Every primary vtable in the image with its class chain (most-derived first). A scan of the read-only
+/// data sections (MSVC puts vtables and their RTTI locators there), done once at startup.
 pub fn all_vtables(img: &Image) -> Vec<(usize, Vec<String>)> {
+    const WRITE: u32 = 0x8000_0000;
+    let rdata: Vec<_> = img.sections.iter().filter(|s| !s.is_code() && s.characteristics & WRITE == 0).map(|s| s.range()).collect();
+    let in_rdata = |rva: usize| rdata.iter().any(|r| r.contains(&rva));
+    let rd = |at: usize| img.bytes.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let mut out = Vec::new();
-    for s in img.sections.iter().filter(|s| !s.is_code()) {
-        let end = (s.rva + s.size).min(img.bytes.len()).saturating_sub(16);
-        for at in (s.rva..end).step_by(8) {
-            let Ok(col) = img.u64_at(at).and_then(|p| img.rva_of_ptr(p)) else { continue };
-            let is_primary_col = img.u32_at(col).ok() == Some(1)
-                && img.u32_at(col + 4).ok() == Some(0)
-                && img.u32_at(col + 0x14).ok().map(|x| x as usize) == Some(col);
+    for r in &rdata {
+        let end = r.end.min(img.bytes.len()).saturating_sub(16);
+        for at in (r.start..end).step_by(8) {
+            let p = u64::from_le_bytes(img.bytes[at..at + 8].try_into().unwrap());
+            // Cheap checks first (no allocation): the locator lives in read-only data too.
+            let Some(col) = p.checked_sub(img.va_base).map(|c| c as usize).filter(|&c| in_rdata(c)) else { continue };
+            let is_primary_col = rd(col) == Some(1) && rd(col + 4) == Some(0) && rd(col + 0x14).map(|x| x as usize) == Some(col);
             if is_primary_col && let Ok(chain) = class_hierarchy(img, at + 8) {
                 out.push((at + 8, chain));
             }

@@ -38,6 +38,59 @@ mod patterns {
     pub const POD_PROGRAM: &str = "4C 8B DC 57 48 81 EC A0 01 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 50 01 00 00 83 B9 60 5B 01 00 00";
     /// Referenced right before `lea rcx,[camera_game]` (AutomataMP `CameraGame.cpp`).
     pub const CAMERA_STRING: &str = "Step : %d / %d";
+    /// The getters that turn the possessed handle into the player, which enemy AI asks for its target
+    /// (build 7788). Each is found among the references to `possessed`, and its `lea` (at the offset given)
+    /// must point there.
+    /// `get_player() -> Pl0000*`: copy the handle twice, handle -> entity, entity -> Pl0000. 0x7c4f50.
+    pub const GET_PLAYER: (&str, usize) = (
+        "48 83 EC 28 48 8D 15 ? ? ? ? 48 8D 4C 24 30 E8 ? ? ? ? 48 8B D0 48 8D 4C 24 38 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 83 C4 28 C3",
+        4,
+    );
+    /// Offset of get_player's `call handle_to_entity` (its third call).
+    pub const GET_PLAYER_H2E_CALL: usize = 0x25;
+    /// `get_player_entity() -> Entity*`: `lea rcx,[possessed]; jmp handle_to_entity`. A leaf without
+    /// `.pdata`. 0x7c5020.
+    pub const GET_PLAYER_ENTITY: (&str, usize) = ("48 8D 0D ? ? ? ? E9", 0);
+    /// `get_player_pos(out) -> out`: the player's position (Model+0x50), or (0, 0, 0, 1) without one. 0x7c5050.
+    pub const GET_PLAYER_POS: (&str, usize) = (
+        "40 53 48 83 EC 30 48 8B D9 48 8D 15 ? ? ? ? 48 8D 4C 24 48 E8 ? ? ? ? 48 8B D0 48 8D 4C 24 50 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 8B CB 48 85 C0 75 ? F3 0F 10 05 ? ? ? ? 0F 57 DB 0F 57 D2 F3 0F 11 44 24 20 0F 57 C9 E8 ? ? ? ? 48 8B C3 48 83 C4 30 5B C3 48 8D 50 50 E8",
+        9,
+    );
+    /// Start of `Pl0000::warp(this, &pos, &rot, 0, 0.0)`, the engine's teleport (it moves the previous
+    /// positions and the collision body along with `position`). nier_coop `sdk::patterns::WARP` (exe 2026-10-09:
+    /// 0x4f0fa0).
+    pub const WARP: &str = "48 8B C4 55 56 57 41 54 41 55 48 8D 68 A9 48 81 EC A0 00 00 00 81 B9 70 06 00 00 D3 00 00 00";
+    /// The kill-area death in the player's hit update (nier_coop `notes/death-and-warp.md`):
+    /// `mov [r12+0x10668],esi; mov [r12+0x858],esi` (life = health = 0), then `lea edx,[r9+0x35]` (death state).
+    pub const KILL_AREA: &str = "41 89 B4 24 68 06 01 00 41 89 B4 24 58 08 00 00";
+    /// First bytes of `Action::request_state(this, &StateReq)` (nier_coop `sdk::patterns::REQUEST_STATE`).
+    pub const REQUEST_STATE: &str = "48 89 5C 24 10 57 48 83 EC 30 48 8B D9 48 8B FA 8B 0A 39 4B 20";
+    /// Offset of the `call request_state` inside the `PhaseEventAction.load` native.
+    pub const LOAD_REQUEST_CALL: usize = 0x8C;
+    /// `lea rcx,[action_scene]` at +0x14 (nier_coop `sdk::patterns::ACTION_SCENE`).
+    pub const ACTION_SCENE: &str = "8B 05 ? ? ? ? 0F BA F0 1C 0F BA E8 1E 89 05 ? ? ? ? 48 8D 0D ? ? ? ? E8";
+    pub const ACTION_SCENE_LEA: usize = 0x14;
+}
+
+/// Native behind a script function, read from its static registration: the initializer that references
+/// the name loads the native with `lea rax,[native]` within its first four instructions.
+fn script_native(img: &Image, name: &str) -> Result<usize> {
+    let lea = pat("48 8D 05");
+    let mut found: Vec<usize> = img
+        .string_refs(name)?
+        .into_iter()
+        .filter_map(|r| {
+            let init = img.function_at(r).ok()?.begin;
+            img.insn_target(img.find_insn(init, 4, &lea).ok()?).ok()
+        })
+        .filter(|&f| img.is_code(f))
+        .collect();
+    found.dedup();
+    match found[..] {
+        [one] => Ok(one),
+        [] => err("no registration found"),
+        _ => err(format!("{} different natives", found.len())),
+    }
 }
 
 /// Bytes a hook overwrites (ilhook always writes a 14-byte absolute jmp; retour writes at most that).
@@ -82,6 +135,24 @@ pub struct Addresses {
     pub em_start_animation: usize,
     /// Global `CameraGame` object.
     pub camera: usize,
+    /// `fn() -> *mut Pl0000`: the possessed character (null if it is not a Pl0000).
+    pub get_player: usize,
+    /// `fn() -> *mut Entity`: the possessed entity.
+    pub get_player_entity: usize,
+    /// `fn(out: *mut cVec4) -> *mut cVec4`: the possessed character's position.
+    pub get_player_pos: usize,
+    /// Primary vtables of every class deriving from `EmBase` (enemies and bosses).
+    pub em_vtables: Vec<usize>,
+    /// `fn(*mut Pl0000, *const cVec4 pos, *const cVec4 rot, u32 0, f32 0.0)`: the engine's teleport.
+    pub warp: usize,
+    /// `fn(*mut SceneAction, *const StateReq) -> bool`: every scene action's state change (hooked).
+    pub request_state: usize,
+    /// `fn(*mut SceneAction) -> bool`: the `PhaseEventAction.play` native (loads the cutscene if needed).
+    pub phase_play: usize,
+    /// Static `ActionScene`: every loaded scene action group.
+    pub action_scene: usize,
+    /// Primary `hap::PhaseEventAction` vtable (cutscenes).
+    pub phase_vtable: usize,
 }
 
 impl Addresses {
@@ -171,8 +242,73 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         img.insn_target(lea)
     })())?;
 
+    let find_getter = |(p, lea_at): (&str, usize), extra: &dyn Fn(usize) -> bool| -> Result<usize> {
+        let p = pat(p);
+        let mut hits: Vec<usize> = img
+            .refs_to(possessed)
+            .into_iter()
+            .filter_map(|r| (r.checked_sub(7 + lea_at)).filter(|&s| p.matches_at(img.bytes, s)))
+            .filter(|&s| img.insn_target(s + lea_at).ok() == Some(possessed) && extra(s))
+            .collect();
+        hits.dedup();
+        match hits[..] {
+            [one] => Ok(one),
+            [] => err("no match"),
+            _ => err(format!("{} matches", hits.len())),
+        }
+    };
+    let get_player = ctx("get_player", find_getter(patterns::GET_PLAYER, &|_| true))?;
+    // get_player's third call is handle -> entity. get_player_entity tail-jumps to the same function (a
+    // static initializer elsewhere also starts with `lea rcx,[possessed]; jmp`, to something else).
+    let handle_to_entity = ctx("handle_to_entity", img.insn_target(get_player + patterns::GET_PLAYER_H2E_CALL))?;
+    let get_player_entity = ctx(
+        "get_player_entity",
+        find_getter(patterns::GET_PLAYER_ENTITY, &|s| img.insn_target(s + 7).ok() == Some(handle_to_entity)),
+    )?;
+    let get_player_pos = ctx("get_player_pos", find_getter(patterns::GET_PLAYER_POS, &|_| true))?;
+
+    let em_vtables = ctx("EmBase vtables", (|| {
+        let v: Vec<usize> =
+            rtti::all_vtables(img).into_iter().filter(|(_, ch)| ch.iter().any(|c| c == ".?AVEmBase@@")).map(|(vt, _)| vt).collect();
+        if v.len() < 30 {
+            return err(format!("only {} classes derive from EmBase", v.len()));
+        }
+        for &vt in &v {
+            for slot in sdk::UPDATE_SLOTS {
+                rtti::vtable_slot(img, vt, slot)?;
+            }
+        }
+        Ok(v)
+    })())?;
+
+    let warp = ctx("warp", img.find_unique_code("pattern", &pat(patterns::WARP)))?;
+    // Shared death writes `life` and starts the death state the way a kill area does; check that code is
+    // still there with the same offsets.
+    ctx("kill area", img.find_unique_code("pattern", &pat(patterns::KILL_AREA)))?;
+    let request_state = ctx("request_state", (|| {
+        let load = script_native(img, "PhaseEventAction.load")?;
+        let call = load + patterns::LOAD_REQUEST_CALL;
+        if img.bytes.get(call) != Some(&0xE8) {
+            return err(format!("no call at PhaseEventAction.load+{:#x}", patterns::LOAD_REQUEST_CALL));
+        }
+        let f = img.insn_target(call)?;
+        if !pat(patterns::REQUEST_STATE).matches_at(img.bytes, f) {
+            return err(format!("unexpected code at {f:#x}"));
+        }
+        Ok(f)
+    })())?;
+    let phase_play = ctx("PhaseEventAction.play", script_native(img, "PhaseEventAction.play"))?;
+    let action_scene = ctx("action_scene", (|| {
+        let at = img.find_unique_code("pattern", &pat(patterns::ACTION_SCENE))?;
+        img.insn_target(at + patterns::ACTION_SCENE_LEA)
+    })())?;
+    let phase_vtable = ctx("PhaseEventAction vtable", rtti::find_vtable(img, "PhaseEventAction@hap"))?;
+
     // Every patched site must be safe to overwrite.
     for (name, site) in [
+        ("request_state", request_state),
+        ("get_player", get_player),
+        ("get_player_pos", get_player_pos),
         ("update", update),
         ("spawn", spawn),
         ("held_store", held_store),
@@ -182,6 +318,9 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
     ] {
         ctx(&format!("hook site {name}"), img.check_hook_site(site, HOOK_PATCH_LEN))?;
     }
+    // get_player_entity has no `.pdata`, so `check_hook_site` can't look at it; its whole body is the 12
+    // bytes the pattern matched (`lea; jmp`), no branch can land inside them except at the start, and the
+    // retour patch (a 5-byte jmp) stays inside the `lea`.
 
     Ok(Addresses {
         base,
@@ -202,6 +341,15 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         em_base_vtable,
         em_start_animation,
         camera,
+        get_player,
+        get_player_entity,
+        get_player_pos,
+        em_vtables,
+        warp,
+        request_state,
+        phase_play,
+        action_scene,
+        phase_vtable,
     })
 }
 
@@ -317,6 +465,97 @@ pub(crate) mod tests {
         let die_end = img.function_at(die).unwrap().end;
         let starts = |id: u32| Pattern::exact(&[&[0xBA][..], &id.to_le_bytes()].concat()).find_all(&img.bytes[die..die_end]).count();
         assert!(sdk::EM_DIE_STATES.iter().all(|&s| starts(s) > 0), "die routine no longer starts {:x?}", sdk::EM_DIE_STATES);
+    }
+
+    /// The player getters enemy targeting hooks (`sync::aggro`) and the enemy update slots it wraps.
+    /// Verified on build 7788 (2026-11-22): get_player 0x7c4f50, get_player_entity 0x7c5020, get_player_pos
+    /// 0x7c5050, 34+ EmBase classes, EmBase slot 7 = 0x6009f0 and slot 8 = 0x688dd0.
+    /// `NIER_EXE=<exe> cargo test player_getters_and_enemy_updates -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn player_getters_and_enemy_updates() {
+        let bytes = exe_image();
+        let img = Image::new(&bytes, None).unwrap();
+        let t = std::time::Instant::now();
+        let a = resolve(&img, 0).unwrap();
+        println!("resolve took {:?}; {} EmBase classes", t.elapsed(), a.em_vtables.len());
+        println!("get_player {:#x}, get_player_entity {:#x}, get_player_pos {:#x}", a.get_player, a.get_player_entity, a.get_player_pos);
+        if a.build == EXPECTED_BUILD {
+            assert_eq!((a.get_player, a.get_player_entity, a.get_player_pos), (0x7c4f50, 0x7c5020, 0x7c5050));
+            let em = |s| rtti::vtable_slot(&img, a.em_base_vtable, s).unwrap();
+            assert_eq!((em(7), em(8)), (0x6009f0, 0x688dd0));
+        }
+        assert!(a.em_vtables.contains(&a.em_base_vtable));
+        assert!(a.em_vtables.len() >= 34, "only {} EmBase classes", a.em_vtables.len());
+        for f in [a.get_player, a.get_player_pos] {
+            assert_eq!(img.function_at(f).unwrap().begin, f);
+        }
+        // get_player_entity: `lea rcx,[possessed]; jmp handle_to_entity`, and get_player calls the same
+        // handle_to_entity (its third call), so both return the same entity.
+        let h2e = img.insn_target(a.get_player_entity + 7).unwrap();
+        assert_eq!(img.insn_target(a.get_player + patterns::GET_PLAYER_H2E_CALL).unwrap(), h2e);
+        // Every enemy class's update slots point at code, and none of them is one of our other hook targets.
+        for &vt in &a.em_vtables {
+            for s in sdk::UPDATE_SLOTS {
+                let f = rtti::vtable_slot(&img, vt, s).unwrap();
+                assert!(img.is_code(f) && f != a.em_start_animation);
+            }
+        }
+    }
+
+    /// Shared death and cutscene sync (`sync::events`): the warp, the kill-area code whose offsets shared
+    /// death copies, `request_state`, `PhaseEventAction.play`, the action scene and the cutscene vtable.
+    /// `NIER_EXE=<exe> cargo test death_and_cutscene -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn death_and_cutscene() {
+        let bytes = exe_image();
+        let img = Image::new(&bytes, None).unwrap();
+        let a = resolve(&img, 0).unwrap();
+        println!(
+            "warp {:#x}, request_state {:#x}, phase_play {:#x}, action_scene {:#x}, phase_vtable {:#x}",
+            a.warp, a.request_state, a.phase_play, a.action_scene, a.phase_vtable
+        );
+        for f in [a.warp, a.request_state, a.phase_play] {
+            assert_eq!(img.function_at(f).unwrap().begin, f, "{f:#x} is not a function start");
+        }
+        assert!(!img.is_code(a.action_scene));
+        let chain = rtti::class_hierarchy(&img, a.phase_vtable).unwrap();
+        assert_eq!(chain.first().map(String::as_str), Some(".?AVPhaseEventAction@hap@@"));
+        // The kill area's death state follows its two stores: `lea edx,[r9+0x35]`.
+        let k = img.find_unique_code("pattern", &pat(patterns::KILL_AREA)).unwrap();
+        let near = &img.bytes[k..k + 0x40];
+        assert!(near.windows(4).any(|w| w == [0x41, 0x8D, 0x51, sdk::ANIM_DEATH as u8]), "no death state after the kill area");
+        // The warp refuses state 0xD3 (`cmp dword ptr [rcx+0x670],0xD3` in its prologue).
+        assert_eq!(&img.bytes[a.warp + 0x15..a.warp + 0x17], &[0x81, 0xB9]);
+        if a.build == EXPECTED_BUILD {
+            assert_eq!(
+                (a.warp, a.request_state, a.phase_play, a.action_scene, a.phase_vtable),
+                (0x4f0fa0, 0x3ec650, 0x3a91f0, 0xfca888, 0xc40758), // verified 2026-11-22
+                "build 7788 values changed"
+            );
+        }
+    }
+
+    /// Save redirection (`hooks::savefile`) relies on every save file being opened by name, from one path
+    /// builder, through `CreateFileA` / `DeleteFileA` (`notes/2026-11-22-save-files-reversing.md`). Verified on
+    /// build 7788: the builder is 0x282cd0, with 4 callers.
+    /// `NIER_EXE=<exe> cargo test save_file_io -- --ignored`
+    #[test]
+    #[ignore]
+    fn save_file_io() {
+        let bytes = exe_image();
+        let img = Image::new(&bytes, None).unwrap();
+        let refs = img.string_refs("%sSlotData_%d.dat").unwrap();
+        assert_eq!(refs.len(), 1, "slot file name built in more than one place");
+        let builder = img.function_at(refs[0]).unwrap().begin;
+        assert!(img.refs_to(builder).len() >= 4, "save path builder has fewer callers than read/read/write/delete");
+        if img.timestamp == EXPECTED_BUILD {
+            assert_eq!(builder, 0x282cd0);
+        }
+        for name in ["CreateFileA", "DeleteFileA", "ReadFile", "WriteFile"] {
+            assert!(img.find_string(name).is_ok(), "{name} no longer imported");
+        }
     }
 
     /// Prints which DLLs the exe imports (is dinput8 a static import?) and other build facts.

@@ -27,6 +27,18 @@ pub struct Config {
     /// fills, and no crash was seen with it on). Turn off if enemy fights crash: an id the engine has never
     /// used for that class could.
     pub enemy_replay_unverified: bool,
+    /// Host: enemies and bosses target whichever player is nearer, not only the host's character (see
+    /// `sync::aggro`). Added 2026-11-22, not yet verified in-game; turn off if enemies act strangely.
+    pub enemy_target_client: bool,
+    /// When the other player's character dies, yours dies too, so both games reload their last checkpoint.
+    /// Each player's own setting decides whether they follow the other's death.
+    pub shared_death: bool,
+    /// When the other player starts a cutscene, warp to them and play it too. Each player's own setting
+    /// decides whether they follow.
+    pub cutscene_sync: bool,
+    /// Client: the host's save shows as "[online] <name>" in the save list (its player name is changed in the
+    /// client's copy only). Turn off if that slot shows as damaged.
+    pub online_save_label: bool,
 }
 
 impl Default for Config {
@@ -39,6 +51,10 @@ impl Default for Config {
             log_level: "info".into(),
             debug_panel: false,
             enemy_replay_unverified: true,
+            enemy_target_client: true,
+            shared_death: true,
+            cutscene_sync: true,
+            online_save_label: true,
         }
     }
 }

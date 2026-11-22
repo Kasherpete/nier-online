@@ -2,6 +2,7 @@
 //! `D3D11Hook.cpp` / `WindowsMessageHook.cpp`). It never touches game memory: it reads the status structs
 //! in `crate::state` and sends commands through queues.
 
+mod chat;
 mod clipboard;
 mod cursor;
 
@@ -15,6 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::config::{self, Config};
+use crate::hooks::savefile;
 use crate::state::{self, NetCommand, Q};
 
 const GREEN: [f32; 4] = [0.4, 0.9, 0.4, 1.0];
@@ -37,9 +39,17 @@ struct Overlay {
     vk: u16,
     join_code: String,
     chat: String,
+    chat_box: chat::ChatBox,
+    /// Game input was blocked last frame (menu or chat box open).
+    captured: bool,
     cfg: Config,
     save_msg: Option<(String, bool)>,
     entity_filter: String,
+    /// "Join" needs a restart: the code to join after it (shows the confirmation).
+    restart_code: Option<String>,
+    restart_error: Option<String>,
+    /// "Host" was pressed: the saves to pick the shared world from.
+    world_picker: Option<Vec<crate::net::save::SlotInfo>>,
 }
 
 impl Overlay {
@@ -51,13 +61,19 @@ impl Overlay {
             vk: config::vk_from_name(&cfg.overlay_key).unwrap_or(0x2D),
             join_code: String::new(),
             chat: String::new(),
+            chat_box: chat::ChatBox::new(),
+            captured: false,
             cfg,
             save_msg: None,
             entity_filter: String::new(),
+            restart_code: None,
+            restart_error: None,
+            world_picker: None,
         }
     }
 
-    /// Edge-detects the toggle key, only while this game window has focus (two copies can run side by side).
+    /// Edge-detects the menu and chat keys, only while this game window has focus (two copies can run side
+    /// by side), and blocks game input while either is open.
     fn poll_toggle(&mut self) {
         // SAFETY: plain Win32 queries.
         let focused = unsafe {
@@ -68,13 +84,45 @@ impl Overlay {
         let down = focused && unsafe { GetAsyncKeyState(self.vk as i32) } as u16 & 0x8000 != 0;
         if down && !self.key_was_down {
             self.visible = !self.visible;
-            state::OVERLAY_VISIBLE.store(self.visible, Relaxed);
-            if self.visible {
-                cursor::release();
-            }
             state::DEBUG_LIST_WANTED.store(self.visible && self.cfg.debug_panel, Relaxed);
         }
         self.key_was_down = down;
+        self.chat_box.poll(focused, self.visible);
+        let captured = self.capturing();
+        if captured && !self.captured {
+            cursor::release();
+        }
+        self.captured = captured;
+        state::OVERLAY_VISIBLE.store(captured, Relaxed);
+    }
+
+    fn capturing(&self) -> bool {
+        self.visible || self.chat_box.captures()
+    }
+}
+
+/// "5 min ago" style age of a save.
+fn ago(t: std::time::SystemTime) -> String {
+    let s = t.elapsed().map_or(0, |d| d.as_secs());
+    match s {
+        0..60 => "just now".into(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86_400 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// Host: which world is shared, and a warning when the host is playing a different slot.
+fn shared_world_line(ui: &Ui, info: &state::OverlayInfo) {
+    let shared = crate::net::save::shared();
+    match shared {
+        Some(s) => ui.text_colored(GREEN, format!("Sharing your world in slot {}.", s + 1)),
+        None => ui.text_colored(GREY, "Sharing your newest save (none yet for a new game)."),
+    }
+    if let (Some(s), Some(l), true) = (shared, savefile::loaded_slot(), info.local_player)
+        && s != l
+    {
+        ui.text_colored(RED, format!("You are playing slot {}: load slot {} so both worlds match.", l + 1, s + 1));
     }
 }
 
@@ -105,13 +153,14 @@ impl ImguiRenderLoop for Overlay {
     fn before_render(&mut self, ctx: &mut Context, _: &mut dyn RenderContext) {
         self.poll_toggle();
         // The game hides the system cursor; draw ImGui's own while the menu is open.
-        ctx.io_mut().mouse_draw_cursor = self.visible;
+        ctx.io_mut().mouse_draw_cursor = self.visible || self.chat_box.open;
     }
 
     fn render(&mut self, ui: &mut Ui) {
         let net = state::NET_STATUS.lock().map(|s| s.clone()).unwrap_or_default();
         let info = state::OVERLAY.lock().map(|o| o.clone()).unwrap_or_default();
         self.draw_name_tag(ui, &net, &info);
+        self.chat_box.draw(ui, net.connected);
         if !self.visible {
             let line = match net.rtt_ms {
                 Some(r) if net.connected => format!("nier-online: {} | {:.0} ms {}", net.state, r, net.path.unwrap_or("")),
@@ -148,7 +197,7 @@ impl ImguiRenderLoop for Overlay {
     }
 
     fn message_filter(&self, _io: &Io) -> MessageFilter {
-        if self.visible { MessageFilter::InputAll } else { MessageFilter::empty() }
+        if self.capturing() { MessageFilter::InputAll } else { MessageFilter::empty() }
     }
 }
 
@@ -182,18 +231,29 @@ impl Overlay {
             ui.text(format!("Player: {}", net.peer_name.as_deref().unwrap_or("?")));
             ui.text(format!("Their mod version: {}", net.peer_version.as_deref().unwrap_or("?")));
             match net.rtt_ms {
-                Some(r) => ui.text(format!("Ping: {r:.0} ms ({})", net.path.unwrap_or("?"))),
+                Some(r) => ui.text(format!(
+                    "Ping: {r:.0} ms, loss {:.1}% ({})",
+                    net.loss_pct.unwrap_or(0.0),
+                    match net.path {
+                        Some("relay") => "through a relay server",
+                        Some("direct") => "direct connection",
+                        _ => "?",
+                    }
+                )),
                 None => ui.text("Ping: measuring..."),
             }
             if let Some(es) = &info.enemy {
                 enemy_stats(ui, es);
             }
+            ui.separator();
+            self.world_status(ui, net, info);
             if ui.button("Disconnect") {
                 let _ = Q.net_cmds.push(NetCommand::Disconnect);
             }
             return;
         }
         if let Some(code) = &net.join_code {
+            shared_world_line(ui, info);
             ui.text("Send this join code to your friend:");
             ui.text_wrapped(code);
             if ui.button("Copy join code") {
@@ -212,9 +272,13 @@ impl Overlay {
             }
             return;
         }
+        if self.world_picker.is_some() {
+            self.world_picker_panel(ui, info);
+            return;
+        }
         ui.text("Host a game (your world, enemies and story are used):");
         if ui.button("Host") {
-            let _ = Q.net_cmds.push(NetCommand::Host);
+            self.world_picker = Some(crate::net::save::save_dir().map(|d| crate::net::save::slot_infos(&d)).unwrap_or_default());
         }
         ui.separator();
         ui.text("Or join a friend's game:");
@@ -225,9 +289,16 @@ impl Overlay {
                 self.join_code = t.trim().to_string();
             }
         }
-        if ui.button("Join") && !self.join_code.trim().is_empty() {
-            let _ = Q.net_cmds.push(NetCommand::Join(self.join_code.trim().to_string()));
+        let code = self.join_code.trim().to_string();
+        if ui.button("Join") && !code.is_empty() {
+            self.join_host_world(code);
         }
+        ui.text_colored(
+            GREY,
+            "You play in the host's world: their save shows as \"[online]\" in Load Game (the game restarts first if it \
+             has already read its saves). While you are joined, your own saves cannot be loaded and are never changed.",
+        );
+        self.restart_prompt(ui);
         ui.separator();
         ui.text_colored(GREY, "Testing alone:");
         if ui.button("Mirror test") {
@@ -237,8 +308,99 @@ impl Overlay {
         ui.text_colored(GREY, "(a copy of you follows 2 m to the side)");
     }
 
+    /// After "Host": which save slot to share. The client gets it as soon as it connects, so the host does not
+    /// need to be in that world yet.
+    fn world_picker_panel(&mut self, ui: &Ui, info: &state::OverlayInfo) {
+        let slots = self.world_picker.clone().unwrap_or_default();
+        ui.text("Which world do you want to share?");
+        if slots.is_empty() {
+            ui.text_colored(GREY, "No saves found.");
+        }
+        let loaded = savefile::loaded_slot().filter(|_| info.local_player);
+        for s in &slots {
+            let name = if s.name.is_empty() { "(no name)" } else { s.name.as_str() };
+            let now = if loaded == Some(s.slot) { ", playing now" } else { "" };
+            if ui.button(format!("Slot {}: {name}  (saved {}{now})", s.slot + 1, ago(s.saved))) {
+                let _ = Q.net_cmds.push(NetCommand::Host(Some(s.slot)));
+                self.world_picker = None;
+            }
+        }
+        if ui.button("New game (shares your first save once you make one)") {
+            let _ = Q.net_cmds.push(NetCommand::Host(None));
+            self.world_picker = None;
+        }
+        ui.text_colored(GREY, "The other player gets this save as soon as they join. Load the same slot yourself.");
+        if ui.button("Cancel##host") {
+            self.world_picker = None;
+        }
+    }
+
+    /// Joins `code` in the host's world: right away if the game has not read its save list yet (the list then
+    /// waits for the host's save), otherwise after a confirmed restart.
+    fn join_host_world(&mut self, code: String) {
+        if savefile::listed() {
+            self.restart_code = Some(code);
+        } else {
+            savefile::enter_host_world();
+            savefile::hold_next_read(true);
+            let _ = Q.net_cmds.push(NetCommand::Join(code));
+        }
+    }
+
+    fn restart_prompt(&mut self, ui: &Ui) {
+        let Some(code) = self.restart_code.clone() else { return };
+        ui.separator();
+        ui.text_colored(RED, "The game restarts to load the host's world. Unsaved progress is lost.");
+        if ui.button("Restart now") {
+            if let Err(e) = savefile::restart_into_host_world(&code) {
+                self.restart_error = Some(e);
+            }
+        }
+        ui.same_line();
+        if ui.button("Cancel##restart") {
+            self.restart_code = None;
+        }
+        if let Some(e) = &self.restart_error {
+            ui.text_colored(RED, e);
+        }
+    }
+
+    /// Which world each side plays in.
+    fn world_status(&mut self, ui: &Ui, net: &state::NetStatus, info: &state::OverlayInfo) {
+        if state::role() == state::Role::Host {
+            shared_world_line(ui, info);
+            return;
+        }
+        if state::role() != state::Role::Client || net.peer_name.as_deref() == Some("mirror") {
+            return;
+        }
+        let (ready, slot) = savefile::host_save();
+        match savefile::origin() {
+            savefile::Origin::Host => ui.text_colored(GREEN, "You are in the host's world."),
+            _ if info.local_player => {
+                ui.text_colored(RED, "You are playing your own world, not the host's: the two worlds differ.");
+                ui.text_wrapped("Your own saves are protected while connected (saving here does not change them).");
+                if let Some(code) = net.joined_code.clone()
+                    && ui.button("Restart into host's world")
+                {
+                    self.restart_code = Some(code);
+                }
+                self.restart_prompt(ui);
+            }
+            _ => match slot {
+                Some(s) if ready => {
+                    let label = if self.cfg.online_save_label { " (shown as \"[online] ...\")" } else { "" };
+                    ui.text_colored(GREEN, format!("Host's world ready: Load Game -> slot {}{label}.", s + 1));
+                    ui.text_colored(GREY, "Your other slots are blocked while connected. If the list shows your own save");
+                    ui.text_colored(GREY, "in that slot, it is the old list: loading it still loads the host's world.");
+                }
+                _ => ui.text("Waiting for the host's save..."),
+            },
+        }
+    }
+
     fn chat_tab(&mut self, ui: &Ui, net: &state::NetStatus) {
-        let lines = state::CHAT.lock().map(|c| c.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        let lines = state::CHAT.lock().map(|c| c.iter().map(|l| l.text.clone()).collect::<Vec<_>>()).unwrap_or_default();
         ui.child_window("chatlog").size([0.0, -30.0]).border(true).build(|| {
             for l in &lines {
                 ui.text_wrapped(l);
@@ -249,8 +411,10 @@ impl Overlay {
         });
         let send = ui.input_text("##chat", &mut self.chat).enter_returns_true(true).build();
         ui.same_line();
-        if (send || ui.button("Send")) && net.connected && !self.chat.trim().is_empty() {
-            let _ = Q.net_cmds.push(NetCommand::Chat(std::mem::take(&mut self.chat)));
+        if (send || ui.button("Send")) && net.connected
+            && let Some(text) = chat::clean(&std::mem::take(&mut self.chat))
+        {
+            let _ = Q.net_cmds.push(NetCommand::Chat(text));
         }
     }
 
@@ -259,6 +423,10 @@ impl Overlay {
         ui.input_text("Menu key", &mut self.cfg.overlay_key).build();
         ui.checkbox("Enemy sync (host decides)", &mut self.cfg.enemy_sync);
         ui.checkbox("Replay all enemy animations (client; turn off if enemy fights crash)", &mut self.cfg.enemy_replay_unverified);
+        ui.checkbox("Enemies target the nearer player (host)", &mut self.cfg.enemy_target_client);
+        ui.checkbox("Die when your partner dies (next session)", &mut self.cfg.shared_death);
+        ui.checkbox("Join your partner's cutscenes (next session)", &mut self.cfg.cutscene_sync);
+        ui.checkbox("Label the host's save \"[online]\" (client)", &mut self.cfg.online_save_label);
         ui.input_text("Relay URL", &mut self.cfg.relay_url).hint("empty = default public relays").build();
         ui.checkbox("Debug panel", &mut self.cfg.debug_panel);
         ui.input_text("Log level", &mut self.cfg.log_level).build();
@@ -270,6 +438,7 @@ impl Overlay {
                     Ok(()) => {
                         self.vk = vk;
                         state::DEBUG_LIST_WANTED.store(self.cfg.debug_panel, Relaxed);
+                        crate::sync::aggro::set_enabled(self.cfg.enemy_target_client);
                         ("Saved. Relay and log level apply after a restart.".into(), true)
                     }
                     Err(e) => (format!("Could not save: {e}"), false),
@@ -322,7 +491,7 @@ impl Overlay {
 fn enemy_stats(ui: &Ui, es: &state::EnemyStats) {
     ui.separator();
     if es.host {
-        ui.text(format!("Enemy sync (host): sending {} enemies", es.tracked));
+        ui.text(format!("Enemy sync (host): sending {} enemies, {} targeting the other player", es.tracked, es.targeting_client));
         return;
     }
     ui.text(format!(

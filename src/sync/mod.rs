@@ -1,7 +1,9 @@
 //! Game-side sync logic, run once per frame from the update hook on the game thread. Drains the queues the
 //! net thread fills, updates the remote player and (optionally) enemies, and publishes overlay data.
 
+pub mod aggro;
 pub mod entities;
+pub mod events;
 pub mod interp;
 pub mod player;
 pub mod world;
@@ -21,6 +23,7 @@ const ENTITY_LIST_EVERY_MS: f64 = 250.0;
 struct SyncState {
     player: PlayerSync,
     entities: EntitySync,
+    events: events::Events,
     active: bool,
     enemy_sync: bool,
     last_tick_ms: f64,
@@ -32,6 +35,7 @@ static SYNC: LazyLock<Mutex<SyncState>> = LazyLock::new(|| {
     Mutex::new(SyncState {
         player: PlayerSync::new(),
         entities: EntitySync::default(),
+        events: events::Events::default(),
         active: false,
         enemy_sync: false,
         last_tick_ms: 0.0,
@@ -56,6 +60,9 @@ pub fn tick() {
                 st.active = true;
                 st.enemy_sync = enemy_sync;
                 st.player.reset();
+                st.events.start(role);
+                aggro::reset();
+                aggro::set_enabled(crate::config::get().enemy_target_client);
                 if enemy_sync && role != Role::None {
                     st.entities.start(role);
                     st.entities.set_replay_unverified(crate::config::get().enemy_replay_unverified);
@@ -65,11 +72,14 @@ pub fn tick() {
                 tracing::info!("session ended; single-player behavior restored");
                 st.active = false;
                 st.entities.end();
+                st.events.end();
+                aggro::reset();
             }
         }
     }
 
     while let Some(r) = Q.in_player.pop() {
+        st.events.on_peer_snapshot(r.value);
         st.player.on_snapshot(r.at_ms, r.value);
     }
     while let Some(r) = Q.in_entities.pop() {
@@ -82,11 +92,13 @@ pub fn tick() {
             e @ (Event::SpawnEntity(_) | Event::EntityAnim { .. } | Event::EntityDied { .. } | Event::DestroyEntity { .. }) => {
                 st.entities.on_event(e, now)
             }
+            e @ (Event::PlayerDied | Event::Cutscene { .. }) => st.events.on_event(e, now),
             _ => {}
         }
     }
 
     st.player.tick(now, dt, st.active);
+    st.events.tick(now);
     if st.active && st.enemy_sync {
         st.entities.tick(now, dt);
     }
@@ -110,6 +122,7 @@ fn publish_overlay(st: &mut SyncState, now: f64) {
     };
     let Ok(mut o) = state::OVERLAY.try_lock() else { return };
     o.game_ok = true;
+    o.local_player = world::player().is_some();
     o.camera = world::camera();
     o.remote_head = remote.map(player::head_position);
     // SAFETY: validated remote Pl0000.
