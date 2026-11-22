@@ -124,6 +124,9 @@ async fn main_loop() {
             NetCommand::Disconnect | NetCommand::Chat(_) => Ok(()),
         };
         end_session();
+        if let Err(e) = &result {
+            tracing::warn!("network: {e}"); // also shown in the overlay
+        }
         set_idle(result.err());
     }
 }
@@ -136,7 +139,9 @@ async fn host(ep: &Endpoint) -> Result<Option<NetCommand>, String> {
     });
     // So the join code includes the relay, which makes it dialable from anywhere.
     let _ = timeout(Duration::from_secs(10), ep.online()).await;
-    let code = ticket::encode(&ep.addr());
+    let addr = ep.addr();
+    tracing::info!("hosting as {} at {:?}", addr.id.fmt_short(), addr.addrs);
+    let code = ticket::encode(&addr);
     status(|s| {
         s.state = "Hosting: waiting for a player to join".into();
         s.join_code = Some(code);
@@ -182,7 +187,12 @@ async fn host(ep: &Endpoint) -> Result<Option<NetCommand>, String> {
 }
 
 async fn join(ep: &Endpoint, code: &str) -> Result<Option<NetCommand>, String> {
-    let addr = ticket::decode(code)?;
+    let mut addr = ticket::decode(code)?;
+    if loopback_if_same_pc(ep, &mut addr) {
+        tracing::info!("the host is on this PC: dialing it over loopback");
+    }
+    // A code from before the host's game restarted names an id that no longer exists (a new one each launch).
+    tracing::info!("joining {} at {:?}", addr.id.fmt_short(), addr.addrs);
     status(|s| {
         s.state = "Connecting...".into();
         s.busy = true;
@@ -200,6 +210,27 @@ async fn join(ep: &Endpoint, code: &str) -> Result<Option<NetCommand>, String> {
     };
     let (send, recv) = conn.open_bi().await.map_err(|e| format!("could not open a stream: {e}"))?;
     session(conn, send, recv, Role::Client).await
+}
+
+/// Two copies on one PC: the host's code lists this PC's own addresses, and the host's replies to a packet from
+/// one of them fail on Windows (`sendmsg` WSAEINVAL 10022 when sending from this PC's LAN address to itself,
+/// seen 2026-11-22 in iroh debug logs), so the join times out. Dial the same ports on loopback instead.
+/// Returns whether any address was replaced.
+fn loopback_if_same_pc(ep: &Endpoint, host: &mut iroh::EndpointAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use iroh::TransportAddr;
+    let ours: Vec<IpAddr> = ep.addr().addrs.iter().filter_map(|a| if let TransportAddr::Ip(s) = a { Some(s.ip()) } else { None }).collect();
+    let same: Vec<SocketAddr> = host
+        .addrs
+        .iter()
+        .filter_map(|a| if let TransportAddr::Ip(s) = a { ours.contains(&s.ip()).then_some(*s) } else { None })
+        .collect();
+    for s in &same {
+        host.addrs.remove(&TransportAddr::Ip(*s));
+        let lo: IpAddr = if s.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() };
+        host.addrs.insert(TransportAddr::Ip(SocketAddr::new(lo, s.port())));
+    }
+    !same.is_empty()
 }
 
 async fn write_frame(send: &mut SendStream, e: &Event) -> Result<(), String> {

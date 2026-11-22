@@ -69,7 +69,11 @@ deterministic.
 - `src/hooks/`: detours and mid-function hooks, one file per game system.
 - `src/state.rs`: seqlock slots and queues shared between the game thread and the net thread.
 - `src/net/`: the iroh endpoint, the protocol, and session state.
-- `src/sync/`: game-side sync logic (player, entities, world, quests), called from hooks.
+- `src/sync/`: game-side sync logic, called from hooks and the per-frame tick:
+  - `player.rs` (remote 2B, follow-host mode, re-link after cutscenes), `interp.rs` (delayed timeline),
+  - `entities.rs` (enemy sync, pause detection), `world.rs` (entity list, classes, script natives),
+  - `scene.rs` (cutscene + camera-event starts, `request_state` hook), `events.rs` (signals, SendCommand,
+    objectives, enemy sets, scripted-scene steps, area triggers), `quest.rs` (story / quest flags).
 - `src/ui/`: the ImGui overlay.
 - `notes/`: reversing notes, Ghidra/IDA exports, ReClass dumps.
 
@@ -120,7 +124,22 @@ tools\install.ps1            # build + copy into the game folder as dinput8.dll 
   single-instance lock, the named event `NieR:AutomataEvent`, inside the first copy before starting the
   second. Set both copies to windowed mode in the game's options. Both copies share one save folder and
   one mod config. That is fine: iroh binds random ports, and each copy picks Host or Join in its overlay,
-  so no per-instance setting is needed. The overlay key only toggles the focused window.
+  so no per-instance setting is needed. The overlay key only toggles the focused window. What makes two
+  copies usable (all in `src/proxy.rs` and `src/ui/cursor.rs`, verified 2026-11-22):
+  - Only the focused copy reads input: the exe's imports of `XInputGetState` (XINPUT1_4 ordinal 2) and
+    `GetAsyncKeyState` are IAT-patched, and DirectInput reads return "nothing pressed" while unfocused.
+  - The unfocused copy keeps running instead of opening its pause menu: `GetForegroundWindow` is IAT-patched to
+    return the game's own window, and `WM_ACTIVATEAPP` / `WM_ACTIVATE(WA_INACTIVE)` / `WM_KILLFOCUS` are swallowed.
+  - The unfocused copy leaves the mouse alone (`SetCursorPos` / `ClipCursor` dropped, clip released on focus loss).
+  - Joining a host on the same PC dials it over `127.0.0.1` (Windows rejects the host's replies from its own LAN
+    address with WSAEINVAL 10022). The host's identity is random per launch: copy a fresh join code after every
+    relaunch (the log prints `hosting as <id>` / `joining <id>` to compare).
+  - The client's overlay has a **Follow host** checkbox (connected, client only): its 2B copies the host's inputs
+    and animations and stays 2 m beside the host, to test world sync alone.
+- **Debug logging:** `log_level = "debug"` in `nier_online.toml` (next to the exe) also turns on iroh's and noq's
+  debug output (path selection, hole punching, send errors). Set it back to `"info"` afterwards: logs get large.
+  With a session up, every non-noisy scene-action state change is logged as `scene: action <id> <class> ...`
+  (5000 lines per session); see `notes/2026-11-22-two-instance-and-world-sync-session.md`.
 
 ## Libraries
 
@@ -145,12 +164,14 @@ Use the latest stable version of each crate at the time it is added, and pin it 
 
 ## Phase 0: Scaffold
 
-> Status (2026-11-22): verified in-game: the mod loads, join codes connect, the overlay works, and player
-> sync and the name tag work. Phase 6 was reworked on 2026-11-22 (pairing, AI blocking, animation replay,
-> host-driven deaths; see `notes/2026-11-22-enemy-sync-reversing.md`). In-game, enemies now appear on the
-> client and stay in sync. Enemy sync and animation replay are on by default. Every address resolves against
-> the build 7788 exe; the log should say "all 18 addresses resolved". Next step: the rest of the Phase 6
-> checks (deaths, damage, enemy attacks on the client, bosses, disconnect).
+> Status (2026-11-22, v0.3.0, protocol 5): verified in-game: the mod loads, join codes connect, the overlay
+> works, player sync and the name tag work, two copies run side by side on one PC, enemies appear on the client
+> and stay in sync, and most of nier_coop's world sync is ported and working (story flags, signals, SendCommand,
+> objectives, enemy sets; see Phase 8). Every address resolves against the build 7788 exe; the log should say
+> "all 38 addresses resolved". Open problems, in order: (1) a camera event (scripted "mini cutscene") started on
+> the client is accepted but does not take the camera (Phase 8); (2) a mini boss's attacks play on the host only
+> (Phase 6/9); (3) the public n0 relay throttles the connection. Session notes:
+> `notes/2026-11-22-two-instance-and-world-sync-session.md`.
 
 - [x] Cargo `cdylib` crate `nier_online`, edition 2024, stable pinned, target `x86_64-pc-windows-msvc`.
 - [x] `dinput8.dll` proxy: export `DirectInput8Create` and forward it to the real
@@ -208,6 +229,16 @@ The LAN shortcut is covered by the join code, which carries the host's direct ad
 join is not possible because iroh dials by public key. No automatic reconnect yet: after a drop, join again.
 The bulk-transfer stream is not opened until Phase 8 needs it.
 
+In-game findings (2026-11-22):
+- A rejected event ends the session (`decode_event` error -> session over). Senders must therefore never send what
+  the receiver rejects: player animations in `ANIM_CRASHES` or >= `MAX_ANIM` are not sent, and enemy spawn
+  transforms are sanitised (a "non-finite spawn transform" ended a session).
+- Same-PC joins dial loopback (see Build & test). Host / join / failures are logged (`hosting as`, `joining`,
+  `network: ...`).
+- The public n0 relay rate-limits ("outbound relay traffic is being throttled") during long sessions: another
+  reason for the self-hosted relay below.
+- Protocol history: 3 `CutscenePlay`, 4 `SceneEvent` / `SceneSignal` / `SceneStates`, 5 `SCENE_MIRROR`.
+
 Goal: no port forwarding, no Tailscale, no dedicated server. `iroh` gives each player a key-based endpoint
 ID. It connects directly through UDP hole punching when it can, and through a relay server when it can't
 (for example when both players are behind strict carrier-grade NAT). The connection is encrypted QUIC.
@@ -257,7 +288,14 @@ Port this from nier_coop (`hooks/spawn.rs`, `hooks/mod.rs`). Its method came fro
 - [ ] Keep her invincible (`muteki_timer`) and show the peer's HP, because her death would fail the mission.
       Respawn her after the game removes her (area load, restart).
 - [x] Name tag above her head (ImGui, projected with the game camera; see AutomataMP `CameraGame.cpp`).
-- [ ] Verify with the mirror test, then between two PCs.
+- [ ] Verify with the mirror test, then between two PCs. (Mirror test and two copies on one PC verified.)
+- [x] **Follow host** (client overlay checkbox, `state::FOLLOW_HOST`): the client's own 2B is driven by the same
+      `drive` as the puppet, 2 m beside the host; the host's events and controller values are forwarded so the
+      host's puppet of the client animates too. Only the puppet is made invincible. Position verified (stays
+      within ~1 m); the forwarded animations on the host's screen are not verified yet.
+- [ ] **Re-link after cutscenes** (nier_coop `spawn::relink`): when a cutscene ends (`scene::EVENT_ENDED`) or the
+      buddy link breaks, she is unsuspended, given the player routine again and re-linked as buddy (at most once a
+      second). Fires once after each spawn in-game; the post-cutscene case is not verified yet.
 
 ## Phase 6: Enemy sync (host owns enemies, client mirrors them)
 
@@ -270,6 +308,17 @@ In-game findings (2026-11-22, two instances):
 - The host sends only yaw (rotation .y) and a heartbeat batch every 50 ms even when it has no enemies.
   Before that change the client kept losing enemy updates after a few seconds, and its enemies went back to
   their own AI.
+- Later the same day (details in `notes/2026-11-22-two-instance-and-world-sync-session.md`):
+  - **Host pause:** the update hook keeps running in the pause menu, so frozen positions kept arriving and the
+    client's enemies froze or ran in place. `detect_pause`: with enemies around, no bit of any sent enemy state or
+    the host player's position changed for 300 ms, and no animation sent, means paused; the host sends nothing and
+    the client's AI takes over after 1 s (logged both ways). It also fires during cutscenes and when everything
+    stands still, which is harmless.
+  - **Pairing** is closest-pair-first across a model (`assign`); greedy per-entity pairing matched waves 26 m apart.
+  - **Copies** we spawned are never counted as "our own" entities (a lingering replaced copy was paired 37 m away).
+  - An entity that survives 3 terminations is left alone (one em0050 survived termination every 2 s).
+  - One log line per entity: `sending ... as <id>` (host), `paired with our own` / `spawned a copy` (client), and
+    every 10 s `animations sent/played in the last 10 s` per enemy, to compare both sides.
 
 The design combines AutomataMP's (`src/mods/multiplayer/EntitySync.cpp`, the Go server's `SpawnEntity` and
 `EntityData` handlers: the host announces spawns and streams state, the client spawns copies) with the newer
@@ -310,7 +359,11 @@ spawns or deletes where it can't.
 - [ ] **Late join / reconnect:** on connect, the host sends `SpawnEntity` for every live networked entity.
 - [ ] Networked classes: `EmBase` (enemies and bosses) and `BaAnimal`; everything else stays local (boss parts,
       NPCs, hacking enemies, effects, bullets). The check is `ClassInfo::is_networkable` in `sync/world.rs`.
-- [ ] Session end, or no host snapshot for 1 s (host loading): the client's AI runs its enemies again.
+- [x] Session end, or no host snapshot for 1 s (host loading or paused): the client's AI runs its enemies again.
+      Verified 2026-11-22 (host pause, cutscenes, area loads).
+- [ ] **Bosses / mini bosses:** a mini boss (em0042, em5100) paired with the client's own but attacked only on the
+      host. Next: compare its `animations sent` (host) with `animations played` (client). If the host sends almost
+      none, its attacks do not go through `EmBase::start_animation` and the path it uses must be found.
 
 ## Phase 7: Areas and world state
 
@@ -333,15 +386,47 @@ matter here are `src/hooks/events.rs` (cutscene play, SendCommand, objective sta
 retried until the client has loaded the action), `src/hooks/quest.rs` (scene-state sets and resets),
 `src/hooks/savefile.rs` with `src/net/save.rs` (holding the first save read, save transfer), and
 `notes/quest-state.md` and `notes/death-and-warp.md`. Its offsets are for the 2026-10-09 exe; nine of them
-matched build 7788, but re-resolve every one.
+matched build 7788, but re-resolve every one. (On this machine that source is at `C:\Users\micah\Nier Coop Mod`.)
+
+### What is ported (2026-11-22, v0.3.0)
+
+Everything resolves statically in `addr.rs` (all values equal nier_coop's for the 2026-11-19 exe, pinned by
+`resolves_against_exe`): `request_state` 0x3ec650 (hooked), the action scene 0xfca888, the state-request builder
+0x3cffb0 (`PhaseEventAction.load` + 0x77), the signal post 0x34cab0 (hooked) and queue 0xfca918 (`Action.signal`
++0x53 / +0x48), the SceneStateSystem 0xfc2680 with its `set` / `reset` natives and string pool calls (hash 0x28ee30,
+intern 0x150e70, release 0x150c60), and the class vtables PhaseEventAction 0xc40758, CameraAction 0xc40b60,
+SendCommand 0xc46d70, HapGoalLocationAction 0xc4ce60, EnemySetArea 0xc40458, EnemySetAction 0xc403c0,
+PlayerCombatLimitAction 0xc41b08, AreaAction 0xc4c538. Scene-action state hashes are tabled in the session note.
+
+- `sync/scene.rs`, **cutscene starts, both ways** (nier_coop: host -> client only). When a `PhaseEventAction`
+  reaches PLAYING, or a `CameraAction` reaches PLAY (681c330e), its layout id goes out as `CutscenePlay`; the
+  other game plays its own action with that id (`PhaseEventAction.play`, or `request_state(PLAY)` for a camera
+  event), one at a time, waiting up to 60 s for it to load. A later start of the same action object is refused
+  for the session (a cutscene only after it reached DONE, so its own mid-play requests pass); a reload (our
+  character's handle changes) clears that. Simultaneous triggers on both games are deduplicated.
+- `sync/events.rs`, **world events**, ported from nier_coop `events.rs`: host scene signals are posted on the client
+  from its own action with the same id (sender contexts are learned from the client's own posts; a cutscene's own
+  signals are not forwarded); kind 1 SendCommand runs; kind 2 objectives (host -> client, and the client finishing
+  one first finishes it on the host); kind 3 EnemySetArea spawns; kind 4 `SCENE_MIRROR`, new here: EnemySetAction,
+  PlayerCombatLimitAction and AreaAction state changes copied as they are. Events wait up to 180 s for their action
+  to load on the client.
+- `sync/quest.rs`, **story / quest flags** (nier_coop `quest.rs`): the host's SceneState names go out as
+  `SceneStates` when they change (checked every second, resent every 3 s); the client sets what it lacks and
+  resets what the host lacks after 3 lists in a row. `Buddy/`, `PL/`, `DLC_`, `playgo`, `auto/` stay local.
 
 - [ ] **Save sync at startup:** the client holds the game's first save read until the host's save arrives,
       writes it to a separate slot, and loads it, so both games start from identical progress. Never
-      overwrite the client's own saves.
-- [ ] **Quest flags:** hook quest set/reset on the host and replay them on the client. The client never
-      sets quest flags from its own gameplay.
+      overwrite the client's own saves. (Not ported yet: nier_coop `savefile.rs` / `net/save.rs`.)
+- [x] **Quest flags:** the host's story states are copied to the client (`sync/quest.rs`). Verified 2026-11-22: on
+      every join the client set the 33 states its older save lacked (`quest sync: + ...`).
 - [ ] **Cutscenes and scripted events:** relay phase / subphase signals and objective updates from the host.
       Both players watch the cutscene; neither can play until both finish (or the host skips).
+      Verified in-game: PhaseEventAction cutscenes start on both, signals, SendCommand runs, objectives and
+      enemy-set spawns follow the host within ~10-30 ms, and a whole scripted scene's steps run on the client in the
+      host's order. **Open:** a camera event the client is told to play is accepted and stays in PLAY, but the
+      client's camera stays on its 2B (with the scene steps mirrored, it flickers once); the subtitles play. The
+      host's scene starts from an area trigger the client's player is not in, so v0.3.0 mirrors AreaAction too
+      (untested). Not done: waiting for both players before a cutscene ends, and the host skipping.
 - [ ] **Items and money:** decide shared vs. per-player loot. Start with "each player keeps their own pickups".
 - [ ] Death and game over: if the host dies, both reload the host's checkpoint. If the client dies, respawn
       them next to the host instead of failing the mission.
@@ -389,3 +474,7 @@ reverse it live.
 | Overlay UI | — | `D3D11Hook.cpp`, `WindowsMessageHook.cpp`, `Explorer.cpp` |
 | Packet design | `src/net/mod.rs` (validation) | `schema/*.fbs` (message types) |
 | Scripting VM | — | `ScriptFunctions.cpp` (mruby function table) |
+| Cutscenes, signals, world events | `src/hooks/events.rs` (ported to `sync/scene.rs` + `sync/events.rs`) | — |
+| Quest / story flags | `src/hooks/quest.rs` (ported to `sync/quest.rs`) | — |
+| Save sync | `src/hooks/savefile.rs`, `src/net/save.rs` (not ported yet) | — |
+| Two games on one PC | `src/hooks/focus.rs` (background run, input) | — |

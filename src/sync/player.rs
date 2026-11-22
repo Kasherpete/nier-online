@@ -52,7 +52,21 @@ pub struct PlayerSync {
     /// A spawn with the peer's model failed: its assets may not be loaded here, so use 2B.
     fallback_2b: bool,
     last_local: PlayerSnapshot,
+    /// This session may use `state::FOLLOW_HOST` (we are a client of a real host, not the mirror test).
+    pub can_follow: bool,
+    /// Follow-mode diagnostics: on last frame, when the distance to the target was last logged.
+    was_following: bool,
+    last_follow_log_ms: f64,
+    /// Our character's handle last frame: a new one means our game reloaded (death, checkpoint, area load).
+    last_local_handle: u32,
+    /// Earliest time of the next re-link (at most one per second).
+    next_relink_ms: f64,
 }
+
+/// Our own character is following the host this frame (`on_held` forces the host's buttons on it too).
+static FOLLOWING: AtomicBool = AtomicBool::new(false);
+/// How far beside the host a following character stands (m).
+const FOLLOW_SIDE: f32 = 2.0;
 
 fn now_u32(now: f64) -> u32 {
     now as u32
@@ -71,6 +85,12 @@ impl PlayerSync {
     pub fn tick(&mut self, now: f64, dt: f32, active: bool) {
         SENDING.store(active, Relaxed);
         let local = world::player();
+        if let Some((h, _)) = local {
+            if active && self.last_local_handle != 0 && h != self.last_local_handle {
+                crate::sync::scene::forget_played();
+            }
+            self.last_local_handle = h;
+        }
         PLAYER.store(local.map_or(0, |(_, p)| p as usize), Relaxed);
         self.capture_local(local.map(|(_, p)| p), now, active);
 
@@ -79,6 +99,7 @@ impl PlayerSync {
             self.spawned = 0;
         }
         REMOTE.store(0, Relaxed);
+        FOLLOWING.store(false, Relaxed);
         if !active {
             self.despawn(local);
             return;
@@ -88,7 +109,43 @@ impl PlayerSync {
         };
         let Some(b) = remote.or_else(|| self.try_spawn(now, local_handle, pl)) else { return };
         REMOTE.store(b as usize, Relaxed);
-        self.drive(b, now, dt);
+        self.keep_linked(now, local_handle, pl, b);
+        let Some(s) = self.timeline.sample(now) else { return };
+        let events = self.timeline.due_events(now); // taken once: both drives below replay them
+        drive(b, &s, &events, dt, cVec4::default(), true);
+        let follow = self.can_follow && state::FOLLOW_HOST.load(Relaxed);
+        if follow != self.was_following {
+            self.was_following = follow;
+            tracing::info!("follow host: {}", if follow { "on (our 2B copies the host)" } else { "off" });
+        }
+        if follow {
+            FOLLOWING.store(true, Relaxed);
+            // Beside the host: perpendicular to their yaw.
+            let side = cVec4::new(s.rot.y.cos() * FOLLOW_SIDE, 0.0, -s.rot.y.sin() * FOLLOW_SIDE, 0.0);
+            // Read before our write: where the game left her after last frame's correction.
+            // SAFETY: validated Pl0000.
+            let at = unsafe { addr_of!((*pl).base.position).read() };
+            drive(pl, &s, &events, dt, side, false);
+            // The host's puppet of us must move as we now do. `drive` replays through the original
+            // start_animation (our detour, which sends local animations, never sees it), and `capture_local` ran
+            // before our controller fields were written: forward the host's events and inputs ourselves.
+            let t = now_u32(now);
+            for e in &events {
+                let ev = match *e {
+                    RemoteEvent::Anim(args) if sendable_anim(args[0]) => Event::Anim { time_ms: t, args },
+                    RemoteEvent::Anim(_) => continue,
+                    RemoteEvent::Buttons(buttons) => Event::Buttons { time_ms: t, buttons },
+                };
+                let _ = Q.out_events.push(ev);
+            }
+            self.last_local = PlayerSnapshot { speed: s.base.speed, facing2: s.base.facing2, held: s.base.held, ..self.last_local };
+            state::LOCAL_PLAYER.store(&self.last_local);
+            if now - self.last_follow_log_ms >= 2000.0 {
+                self.last_follow_log_ms = now;
+                let target = cVec4::new(s.pos.x + side.x, s.pos.y, s.pos.z + side.z, 1.0);
+                tracing::info!("follow host: our 2B is {:.1} m from her spot beside the host", at.dist(target));
+            }
+        }
     }
 
     fn capture_local(&mut self, pl: Option<*mut Pl0000>, now: f64, active: bool) {
@@ -173,6 +230,38 @@ impl PlayerSync {
         }
     }
 
+    /// Cutscenes suspend her, give her buddy AI back or hand the player another buddy without removing her: she then
+    /// stands frozen or hidden. Set her up again after each cutscene, and whenever the buddy link breaks (nier_coop
+    /// `spawn::relink`, called from its `on_tick` on `EVENT_ENDED`).
+    fn keep_linked(&mut self, now: f64, pl_handle: u32, pl: *mut Pl0000, b: *mut Pl0000) {
+        if now < self.next_relink_ms {
+            return;
+        }
+        // SAFETY: both are validated Pl0000s of the live entity list.
+        let broken = unsafe { addr_of!((*pl).buddy_handle).read() != self.spawned || addr_of!((*b).buddy_handle).read() != pl_handle };
+        let ended = crate::sync::scene::EVENT_ENDED.swap(false, Relaxed);
+        if !(broken || ended) {
+            return;
+        }
+        self.next_relink_ms = now + 1000.0;
+        let Some(from_npc) = world::script_fn("Pl0000.setBuddyFromNpc") else { return };
+        let Some(e) = world::entity_by_handle(self.spawned) else { return };
+        // SAFETY: as above; the script native takes the Pl0000, and the sequence is the one `try_spawn` uses.
+        unsafe {
+            let old = addr_of!((*pl).buddy_handle).read();
+            addr_of_mut!((*b).buddy_handle).write(pl_handle);
+            addr_of_mut!((*pl).buddy_handle).write(self.spawned);
+            world::set_suspend(b.cast(), false);
+            // A cutscene may have given her buddy AI again: back to the player routine (driven by the peer).
+            world::assign_routine(e, c"PLAYER");
+            world::assign_routine(e, c"player");
+            addr_of_mut!((*b).base.obj_flags).write(u32::MAX);
+            std::mem::transmute::<usize, unsafe extern "system" fn(*mut Pl0000)>(from_npc)(b);
+            addr_of_mut!((*b).base.obj_flags).write(0);
+            tracing::info!("re-linked the remote player ({}; the game had buddy {old:#x})", if ended { "cutscene ended" } else { "buddy link broken" });
+        }
+    }
+
     /// Session over: remove her and give the local player back the buddy they had.
     fn despawn(&mut self, local: Option<(u32, *mut Pl0000)>) {
         if self.spawned == 0 {
@@ -191,19 +280,36 @@ impl PlayerSync {
         self.timeline.clear();
     }
 
-    fn drive(&mut self, b: *mut Pl0000, now: f64, dt: f32) {
-        let Some(s) = self.timeline.sample(now) else { return };
+    /// Feeds network input into the timeline (called by `sync::tick` while draining queues).
+    pub fn on_snapshot(&mut self, at_ms: f64, s: PlayerSnapshot) {
+        self.timeline.push_snapshot(at_ms, s);
+    }
+
+    pub fn reset(&mut self) {
+        self.timeline.clear();
+    }
+}
+
+/// Drives `b` from the peer's state `s` and its due `events`: the remote character (`remote`), or, in follow
+/// mode, our own character, `offset` away from the peer. The pod program runs only for the remote: the
+/// engine already runs it for our own character.
+fn drive(b: *mut Pl0000, s: &interp::Sample, events: &[RemoteEvent], dt: f32, offset: cVec4, remote: bool) {
         let peer = s.base;
         let in_pl = peer.flags & PlayerSnapshot::FLAG_PL0000 != 0;
-        // SAFETY: `b` is the validated remote Pl0000.
+        // SAFETY: `b` is a validated Pl0000 (the remote, or our own player).
         unsafe {
-            // Her death would fail the mission, and her real damage happens on the peer's machine.
-            addr_of_mut!((*b).muteki_timer).write(MUTEKI);
-            addr_of_mut!((*b).base.health).write(peer.hp.max(1));
+            if remote {
+                // Her death would fail the mission, and her real damage happens on the peer's machine. Not for
+                // our own character in follow mode: she must take hits here (seen 2026-11-22: enemies hit the
+                // following client for no damage).
+                addr_of_mut!((*b).muteki_timer).write(MUTEKI);
+                addr_of_mut!((*b).base.health).write(peer.hp.max(1));
+            }
             addr_of_mut!((*b).flashlight).write((peer.flags & PlayerSnapshot::FLAG_FLASHLIGHT != 0) as u8);
 
             let pos = addr_of_mut!((*b).base.position);
-            pos.write(interp::correct(pos.read(), s.pos, dt, SNAP_DISTANCE));
+            let target = cVec4 { x: s.pos.x + offset.x, y: s.pos.y + offset.y, z: s.pos.z + offset.z, ..s.pos };
+            pos.write(interp::correct(pos.read(), target, dt, SNAP_DISTANCE));
             addr_of_mut!((*b).base.rotation).write(s.rot);
 
             // Controller inputs: the engine turns these into walk/run/stop and attacks on its own.
@@ -212,8 +318,8 @@ impl PlayerSync {
             addr_of_mut!((*b).speed).write(if in_pl { peer.speed } else { 0.0 });
         }
         let mut held = if in_pl { peer.held } else { 0 };
-        for e in self.timeline.due_events(now) {
-            match e {
+        for e in events {
+            match *e {
                 RemoteEvent::Buttons(buttons) if in_pl => {
                     // SAFETY: as above.
                     unsafe { addr_of_mut!((*b).buttons).write(buttons) };
@@ -229,6 +335,9 @@ impl PlayerSync {
         }
         REMOTE_HELD.store(held, Relaxed);
         set_held(b, held); // also forced in `on_held`, after the engine rebuilds held_flags from her AI
+        if !remote {
+            return;
+        }
         let firing = held & sdk::HELD_POD_FIRE != 0;
         REMOTE_FIRING.store(firing, Relaxed);
         for (a, v) in REMOTE_AIM.iter().zip([peer.aim.x, peer.aim.y, peer.aim.z]) {
@@ -241,16 +350,6 @@ impl PlayerSync {
             unsafe { addr_of_mut!((*b).pod_target).write(t) };
         }
         run_pod_program(b, peer.pod_cooldown);
-    }
-
-    /// Feeds network input into the timeline (called by `sync::tick` while draining queues).
-    pub fn on_snapshot(&mut self, at_ms: f64, s: PlayerSnapshot) {
-        self.timeline.push_snapshot(at_ms, s);
-    }
-
-    pub fn reset(&mut self) {
-        self.timeline.clear();
-    }
 }
 
 /// The remote counts as AI-controlled, so her pod reads `ai_pod_fire` instead of the pod-fire held bit.
@@ -310,19 +409,26 @@ pub fn on_start_animation(this: *mut c_void, anim: u32, variant: u32, a3: u32, a
         if p == REMOTE.load(Relaxed) && anim == sdk::ANIM_PARTNER_WAIT {
             return; // her buddy AI's idle; she mirrors the peer instead
         }
-        if p == PLAYER.load(Relaxed) && SENDING.load(Relaxed) {
+        if p == PLAYER.load(Relaxed) && SENDING.load(Relaxed) && sendable_anim(anim) {
             let _ = Q.out_events.push(Event::Anim { time_ms: now_u32(state::now_ms()), args: [anim, variant, a3, a4] });
         }
     }
     hooks::call_start_animation(this, anim, variant, a3, a4);
 }
 
+/// The peer's `decode_event` rejects these, and a rejected event ends the session: never send them.
+fn sendable_anim(anim: u32) -> bool {
+    anim < crate::net::protocol::MAX_ANIM && !sdk::ANIM_CRASHES.contains(&anim)
+}
+
 /// Mid-hook after the engine rebuilt held_flags from its input source (pad or AI); for the remote, use the
 /// peer's. `ctrl` is the CharacterController (`Pl0000 + 0xCA0`).
 pub fn on_held(ctrl: usize) {
+    let pl = ctrl.wrapping_sub(sdk::CONTROLLER_OFFSET);
     let b = REMOTE.load(Relaxed);
-    if b != 0 && ctrl.wrapping_sub(sdk::CONTROLLER_OFFSET) == b {
-        set_held(b as *mut Pl0000, REMOTE_HELD.load(Relaxed));
+    let following = FOLLOWING.load(Relaxed) && pl == PLAYER.load(Relaxed);
+    if pl != 0 && (pl == b || following) {
+        set_held(pl as *mut Pl0000, REMOTE_HELD.load(Relaxed));
     }
 }
 

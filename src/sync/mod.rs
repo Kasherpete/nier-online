@@ -3,7 +3,10 @@
 
 pub mod entities;
 pub mod interp;
+pub mod events;
 pub mod player;
+pub mod quest;
+pub mod scene;
 pub mod world;
 
 use std::ptr::addr_of;
@@ -47,6 +50,9 @@ pub fn tick() {
     let st = &mut *st;
     let now = state::now_ms();
     let dt = ((now - st.last_tick_ms) / 1000.0).clamp(0.0, 0.25) as f32;
+    if st.active && st.last_tick_ms > 0.0 && now - st.last_tick_ms > 1000.0 {
+        tracing::info!("game tick stalled for {:.1} s (pause menu, load or cutscene?)", (now - st.last_tick_ms) / 1000.0);
+    }
     st.last_tick_ms = now;
 
     while let Some(c) = Q.game_cmds.pop() {
@@ -55,7 +61,10 @@ pub fn tick() {
                 tracing::info!("session started as {role:?} with {peer_name} (enemy sync {enemy_sync})");
                 st.active = true;
                 st.enemy_sync = enemy_sync;
+                scene::start();
                 st.player.reset();
+                // shortcut: the mirror test is recognised by its peer name; following yourself would run away.
+                st.player.can_follow = role == Role::Client && peer_name != "mirror";
                 if enemy_sync && role != Role::None {
                     st.entities.start(role);
                     st.entities.set_replay_unverified(crate::config::get().enemy_replay_unverified);
@@ -65,6 +74,7 @@ pub fn tick() {
                 tracing::info!("session ended; single-player behavior restored");
                 st.active = false;
                 st.entities.end();
+                scene::end();
             }
         }
     }
@@ -82,11 +92,21 @@ pub fn tick() {
             e @ (Event::SpawnEntity(_) | Event::EntityAnim { .. } | Event::EntityDied { .. } | Event::DestroyEntity { .. }) => {
                 st.entities.on_event(e, now)
             }
+            Event::CutscenePlay { id } => scene::on_peer_play(id, now),
+            Event::SceneEvent { id, kind, hash, flag } => events::on_peer_event(id, kind, hash, flag, now),
+            Event::SceneSignal { id, hash, arg } => events::on_peer_signal(id, hash, arg),
+            Event::SceneStates { names } => quest::on_states(names),
             _ => {}
         }
     }
 
     st.player.tick(now, dt, st.active);
+    if st.active {
+        // World events first: a scene's steps (enemy wave, event lock) must run before its camera event joins.
+        events::tick(now);
+        scene::tick(now);
+        quest::tick(now);
+    }
     if st.active && st.enemy_sync {
         st.entities.tick(now, dt);
     }

@@ -80,8 +80,16 @@ fn file_name() -> String {
 
 /// Returns the log file name.
 pub fn init(level_name: &str) -> String {
-    // Our own crate at the configured level; libraries (iroh, quinn) only at warn, since they are chatty.
-    let filter = Targets::new().with_target("nier_online", level(level_name)).with_default(Level::WARN);
+    // Our own crate at the configured level; libraries (iroh, quinn) only at warn, since they are chatty. At
+    // "debug" or "trace", iroh too: its path selection (direct vs relay, hole punching) is how a failed join is
+    // diagnosed.
+    let ours = level(level_name);
+    let iroh = if ours >= Level::DEBUG { Level::DEBUG } else { Level::WARN };
+    let filter = Targets::new()
+        .with_target("nier_online", ours)
+        .with_target("iroh", iroh)
+        .with_target("noq", iroh)
+        .with_default(Level::WARN);
 
     let name = file_name();
     let file = std::fs::File::create(crate::config::game_dir().join(&name)).ok().map(|f| {

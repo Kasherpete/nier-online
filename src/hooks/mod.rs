@@ -129,9 +129,47 @@ fn ret_hook(name: &str, site: usize, f: RetFn) -> Result<(), String> {
 pub type SpawnFn = unsafe extern "system" fn(*mut c_void, *const SpawnParams) -> *mut Entity;
 pub type StartAnimFn = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
 
+/// `bool Action::request_state(this, const StateReq*)`; the bool comes back in al (upper bits undefined).
+pub type RequestStateFn = unsafe extern "system" fn(*mut crate::sdk::SceneAction, *const crate::sdk::StateReq) -> usize;
+
 pub static SPAWN: OnceLock<GenericDetour<SpawnFn>> = OnceLock::new();
 pub static START_ANIM: OnceLock<GenericDetour<StartAnimFn>> = OnceLock::new();
 pub static EM_START_ANIM: OnceLock<GenericDetour<StartAnimFn>> = OnceLock::new();
+pub static REQUEST_STATE: OnceLock<GenericDetour<RequestStateFn>> = OnceLock::new();
+/// `bool post(queue, const Sender*, const StateReq* signal)`: every scene signal goes through here.
+pub type SignalPostFn =
+    unsafe extern "system" fn(usize, *const crate::sdk::SignalSender, *const crate::sdk::StateReq) -> usize;
+pub static SIGNAL_POST: OnceLock<GenericDetour<SignalPostFn>> = OnceLock::new();
+
+unsafe extern "system" fn signal_post_detour(
+    queue: usize,
+    from: *const crate::sdk::SignalSender,
+    sig: *const crate::sdk::StateReq,
+) -> usize {
+    crate::sync::events::on_post(queue, from, sig)
+}
+
+/// Calls the original signal post, bypassing our detour.
+pub fn call_signal_post(queue: usize, from: *const crate::sdk::SignalSender, sig: *const crate::sdk::StateReq) -> usize {
+    match SIGNAL_POST.get() {
+        // SAFETY: as in `call_spawn`; arguments come from the game's own call or are built like it builds them.
+        Some(d) => unsafe { d.call(queue, from, sig) },
+        None => 0,
+    }
+}
+
+unsafe extern "system" fn request_state_detour(this: *mut crate::sdk::SceneAction, req: *const crate::sdk::StateReq) -> usize {
+    crate::sync::scene::on_request(this, req)
+}
+
+/// Calls the original `Action::request_state`, bypassing our detour.
+pub fn call_request_state(this: *mut crate::sdk::SceneAction, req: *const crate::sdk::StateReq) -> usize {
+    match REQUEST_STATE.get() {
+        // SAFETY: as in `call_spawn`; arguments come straight from the game's own call.
+        Some(d) => unsafe { d.call(this, req) },
+        None => 0,
+    }
+}
 
 unsafe extern "system" fn spawn_detour(spawner: *mut c_void, params: *const SpawnParams) -> *mut Entity {
     crate::sync::entities::on_spawn(spawner, params)
@@ -224,6 +262,18 @@ pub fn install(addr: Addresses, img: Image<'static>) -> Result<(), String> {
             &EM_START_ANIM,
             std::mem::transmute::<usize, StartAnimFn>(a.abs(a.em_start_animation)),
             em_start_anim_detour as StartAnimFn,
+        )?;
+        detour(
+            "request_state",
+            &REQUEST_STATE,
+            std::mem::transmute::<usize, RequestStateFn>(a.abs(a.request_state)),
+            request_state_detour as RequestStateFn,
+        )?;
+        detour(
+            "signal_post",
+            &SIGNAL_POST,
+            std::mem::transmute::<usize, SignalPostFn>(a.abs(a.signal_post)),
+            signal_post_detour as SignalPostFn,
         )?;
     }
     mid_hook("held_store", a.abs(a.held_store), on_held_store)?;

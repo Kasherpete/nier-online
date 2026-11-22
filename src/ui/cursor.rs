@@ -24,8 +24,11 @@ static GET_POS: OnceLock<GenericDetour<GetCursorPosFn>> = OnceLock::new();
 /// `i64::MIN` if it never called it.
 static GAME_POS: AtomicI64 = AtomicI64::new(i64::MIN);
 
+/// The game must leave the cursor alone: the overlay is open, or another window (say, the second copy of the
+/// game) is in front. The game never learns it lost focus (see `proxy::focus_wnd_proc`), so it would keep
+/// pinning and clipping the cursor to its own window.
 fn open() -> bool {
-    crate::state::OVERLAY_VISIBLE.load(Relaxed)
+    crate::state::OVERLAY_VISIBLE.load(Relaxed) || !crate::proxy::focused()
 }
 
 unsafe extern "system" fn set_cursor_pos(x: i32, y: i32) -> i32 {
@@ -55,7 +58,7 @@ unsafe extern "system" fn get_cursor_pos(out: *mut POINT) -> i32 {
     GET_POS.get().map_or(0, |d| unsafe { d.call(out) })
 }
 
-/// Called when the overlay opens: lift any clip the game set before.
+/// Called when the overlay opens or the window loses focus: lift any clip the game set before.
 pub fn release() {
     if let Some(d) = CLIP.get() {
         // SAFETY: the original ClipCursor; null means "no clip".

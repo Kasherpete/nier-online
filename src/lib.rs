@@ -78,6 +78,7 @@ fn worker(module: HINSTANCE) {
             return;
         }
     };
+    proxy::gate_unfocused_input(bytes, base);
     let resolved = scan::Image::new(bytes, Some(base as u64)).and_then(|img| addr::resolve(&img, base).map(|a| (a, img)));
     let (addresses, img) = match resolved {
         Ok(v) => v,
@@ -87,7 +88,7 @@ fn worker(module: HINSTANCE) {
             return;
         }
     };
-    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, 18);
+    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, addr::COUNT);
     let build = addresses.build;
     if let Err(e) = hooks::install(addresses, img) {
         // Hooks are installed in an order where a failure leaves the game consistent (the tick goes last).

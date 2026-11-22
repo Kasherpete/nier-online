@@ -304,6 +304,137 @@ pub struct CameraData {
 }
 const _: () = assert!(size_of::<CameraData>() == 0x100 && offset_of!(CameraData, view) == 0xC0);
 
+// Scene actions (cutscenes, triggers, quest steps). Ported from nier_coop `src/sdk/mod.rs` (GPL-3.0), verified
+// there against the 2026-10-09 and 2026-11-19 exes; the action scene layout is re-checked on build 7788 by
+// `addr::tests::resolves_against_exe`.
+
+/// One scripted scene action. `state` is the hash of its current state's name.
+#[repr(C)]
+pub struct SceneAction {
+    pub vtable: usize,        // 0x00
+    _unknown_08: [u8; 0x10],  // 0x08
+    pub id: u32,              // 0x18 layout id (the save's Scene/Action keys); equal on both games
+    pub flags: u32,           // 0x1C
+    pub state: u32,           // 0x20 state name hash
+    _pad_24: u32,             // 0x24
+}
+const _: () = assert!(size_of::<SceneAction>() == 0x28 && offset_of!(SceneAction, state) == 0x20);
+
+/// A group of scene actions.
+#[repr(C)]
+pub struct ActionGroup {
+    _unknown_00: [u8; 0x30],               // 0x00
+    pub actions: *const *mut SceneAction,  // 0x30
+    pub count: usize,                      // 0x38
+}
+const _: () = assert!(size_of::<ActionGroup>() == 0x40 && offset_of!(ActionGroup, count) == 0x38);
+
+/// The static object holding every loaded action group.
+#[repr(C)]
+pub struct ActionScene {
+    _unknown_00: [u8; 0x48],                 // 0x00
+    pub groups: *const *const ActionGroup,   // 0x48
+    pub count: usize,                        // 0x50
+}
+const _: () = assert!(size_of::<ActionScene>() == 0x58 && offset_of!(ActionScene, count) == 0x50);
+
+/// Argument of `Action::request_state` (the engine builds it from a state hash).
+#[repr(C)]
+pub struct StateReq {
+    pub hash: u32,           // 0x00 target state name hash
+    _pad_04: u32,            // 0x04
+    pub name: *const u8,     // 0x08 interned name object (null if the hash has no registered name)
+    pub flag: u32,           // 0x10
+    _pad_14: u32,            // 0x14
+}
+const _: () = assert!(size_of::<StateReq>() == 0x18 && offset_of!(StateReq, flag) == 0x10);
+
+impl Default for StateReq {
+    fn default() -> Self {
+        Self { hash: 0, _pad_04: 0, name: core::ptr::null(), flag: 0, _pad_14: 0 }
+    }
+}
+
+/// Interned, refcounted engine string (a node of the global string pool). nier_coop `sdk::HashedStr`.
+#[repr(C)]
+pub struct HashedStr {
+    _tree: [usize; 4],   // 0x00 pool tree links
+    pub hash: u32,       // 0x20
+    _pad_24: u32,        // 0x24
+    pub text: *const u8, // 0x28 NUL-terminated (inline at 0x38)
+    pub refs: usize,     // 0x30
+}
+const _: () = assert!(size_of::<HashedStr>() == 0x38 && offset_of!(HashedStr, text) == 0x28);
+
+/// One active scene state ("q120/DONE", "Route/A", ...), kept sorted by name hash. nier_coop `sdk::SceneState`.
+#[repr(C)]
+pub struct SceneState {
+    _unknown_00: [usize; 2],   // 0x00
+    pub name: *mut HashedStr,  // 0x10
+    _unknown_18: usize,        // 0x18
+}
+const _: () = assert!(size_of::<SceneState>() == 0x20);
+
+/// `hap::scene_state::SceneStateSystem`, a static object in the image; only its state array is read.
+#[repr(C)]
+pub struct SceneStateSystem {
+    _unknown_00: [u8; 0x98],        // 0x00
+    pub states: *const SceneState,  // 0x98
+    pub count: usize,               // 0xA0
+}
+const _: () = assert!(size_of::<SceneStateSystem>() == 0xA8 && offset_of!(SceneStateSystem, count) == 0xA0);
+
+/// Who posted a scene signal: a scene context and the sender action's id. nier_coop `hooks::events::Sender`.
+#[repr(C)]
+pub struct SignalSender {
+    pub context: usize, // 0x00
+    pub id: u32,        // 0x08
+    _pad_0c: u32,       // 0x0C
+}
+const _: () = assert!(size_of::<SignalSender>() == 0x10);
+
+impl SignalSender {
+    pub fn new(context: usize, id: u32) -> Self {
+        Self { context, id, _pad_0c: 0 }
+    }
+}
+
+/// Scene action state hashes and vtable slots used by world sync (nier_coop `hooks/events.rs`, `sdk::patterns`).
+pub mod action {
+    /// HapGoalLocationAction: WAIT shows the objective, then its update moves it to ACTIVE.
+    pub const WAIT: u32 = 0x4b7b6e51;
+    pub const ACTIVE: u32 = 0xbbe63b84;
+    pub const DONE: u32 = 0x26b80d1f;
+    /// EnemySetArea: WAIT until its area condition holds, SPAWN_DELAY counts down, SPAWN spawns the set.
+    pub const SPAWN_DELAY: u32 = 0x45ce422b;
+    pub const SPAWN: u32 = 0x3aa89d11;
+    /// `SendCommand` slot `run(this, out)`: runs its command list, then requests DONE.
+    pub const SEND_COMMAND_RUN: usize = 9;
+    /// `HapGoalLocationAction` slot `update(this)`: in WAIT sets the HUD objective and map marker.
+    pub const GOAL_UPDATE: usize = 9;
+    /// `HapGoalLocationAction` slot `finish(this)`: removes its marker and HUD objective, then requests DONE.
+    pub const GOAL_FINISH: usize = 12;
+}
+
+/// `PhaseEventAction` (cutscene) state hashes, from the game's state registry (nier_coop `hooks/events.rs`).
+pub mod phase {
+    /// Unnamed state between LOADED and PLAYING: play was requested.
+    pub const PLAY_REQ: u32 = 0xa09a3421;
+    pub const PLAYING: u32 = 0xecbccdf8;
+    /// Reached the last frames, holding.
+    pub const PLAY_END: u32 = 0xcee3b8c9;
+    pub const DONE: u32 = 0x26b80d1f;
+    /// Started: requested, playing or ending.
+    pub const STARTED: [u32; 3] = [PLAY_REQ, PLAYING, PLAY_END];
+}
+
+/// `CameraAction` (scripted camera event) state hashes, from a build 7788 session log (2026-11-22): every
+/// camera action of an area goes 0 -> WAIT when it loads; the one an enemy wave's intro played went 0 -> PLAY.
+pub mod camera {
+    pub const WAIT: u32 = 0x4b7b6e51;
+    pub const PLAY: u32 = 0x681c330e;
+}
+
 /// CRC-32 (IEEE), the hash the engine keys script functions by.
 pub fn crc32(s: &[u8]) -> u32 {
     !s.iter().fold(!0u32, |mut c, &b| {

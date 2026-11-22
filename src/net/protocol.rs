@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::sdk::{self, cVec4};
 
 /// Bumped on any change to the message shapes below. Both sides must match exactly.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 5; // 3: CutscenePlay; 4: SceneEvent, SceneSignal, SceneStates; 5: SCENE_MIRROR
 /// QUIC application protocol id. Kept at /1 across protocol versions, so a peer on another version still
 /// connects and gets the clear refusal from the `Hello` check instead of a bare connection error.
 pub const ALPN: &[u8] = b"nier-online/1";
@@ -109,7 +109,28 @@ pub enum Event {
     /// Host -> client: a host-owned entity was removed from the world.
     DestroyEntity { net_id: u32 },
     Chat { text: String },
+    /// Either way: a cutscene (`PhaseEventAction`, by layout id) started on the sender's game; the receiver
+    /// plays the same one. The id is only compared with our own actions' ids, never used as an address.
+    CutscenePlay { id: u32 },
+    /// A scene action ran on the sender's game (nier_coop `events.rs` kinds): host -> client every kind; client ->
+    /// host only an objective the client's player finished (kind `SCENE_GOAL`, hash DONE). Ids and hashes are only
+    /// compared with our own actions', never used as addresses.
+    SceneEvent { id: u32, kind: u8, hash: u32, flag: u32 },
+    /// Host -> client: a scene signal the host's game posted (sender action id, signal hash, argument).
+    SceneSignal { id: u32, hash: u32, arg: u32 },
+    /// Host -> client: the host's story and quest states ("q120/DONE", "Route/A", ...), all of them.
+    SceneStates { names: Vec<String> },
 }
+
+/// `Event::SceneEvent` kinds (nier_coop numbering; its kind 0 is `Event::CutscenePlay`).
+pub const SCENE_SEND_COMMAND: u8 = 1;
+pub const SCENE_GOAL: u8 = 2;
+pub const SCENE_ENEMY_SET: u8 = 3;
+/// A scripted-scene step (enemy wave, player event lock) whose host state changes the client mirrors as they are.
+pub const SCENE_MIRROR: u8 = 4;
+/// Longest scene state name, and most states in one list.
+pub const MAX_SCENE_STATE: usize = 64;
+pub const MAX_SCENE_STATES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -187,7 +208,14 @@ pub fn decode_event(b: &[u8]) -> Result<Event, DecodeError> {
             check(args[0] < MAX_ANIM, "animation id out of range")?;
             check(!sdk::ANIM_CRASHES.contains(&args[0]), "animation id known to crash")?;
         }
-        Event::Buttons { .. } | Event::DestroyEntity { .. } | Event::EntityDied { .. } => {}
+        Event::Buttons { .. } | Event::DestroyEntity { .. } | Event::EntityDied { .. } | Event::CutscenePlay { .. } => {}
+        Event::SceneSignal { .. } => {}
+        Event::SceneEvent { kind, .. } => check((SCENE_SEND_COMMAND..=SCENE_MIRROR).contains(kind), "unknown scene event kind")?,
+        Event::SceneStates { names } => check(
+            names.len() <= MAX_SCENE_STATES
+                && names.iter().all(|n| !n.is_empty() && n.len() <= MAX_SCENE_STATE && n.bytes().all(|b| b.is_ascii_graphic())),
+            "bad scene state list",
+        )?,
         Event::EntityAnim { args, .. } => check(args[0] < MAX_ANIM, "entity animation id out of range")?,
         Event::SpawnEntity(s) => {
             check(!s.name.is_empty() && s.name.len() <= MAX_ENTITY_NAME && s.name.bytes().all(|b| b.is_ascii_graphic()), "bad entity name")?;

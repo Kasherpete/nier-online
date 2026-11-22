@@ -296,6 +296,9 @@ pub fn push_chat(line: String) {
 pub static OVERLAY: LazyLock<Mutex<OverlayInfo>> = LazyLock::new(|| Mutex::new(OverlayInfo::default()));
 /// The overlay is open: game input is blocked (see `proxy`).
 pub static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Overlay -> game, client only (testing alone with two copies): our own character copies the host's
+/// inputs and animations and stays 2 m beside the host (see `sync::player`).
+pub static FOLLOW_HOST: AtomicBool = AtomicBool::new(false);
 /// Overlay -> game: the debug panel wants the entity list (0 = no) and which handle to inspect.
 pub static DEBUG_LIST_WANTED: AtomicBool = AtomicBool::new(false);
 pub static DEBUG_INSPECT: AtomicU32 = AtomicU32::new(0);

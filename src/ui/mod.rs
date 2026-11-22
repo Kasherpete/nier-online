@@ -3,16 +3,14 @@
 //! in `crate::state` and sends commands through queues.
 
 mod clipboard;
-mod cursor;
+pub(crate) mod cursor;
 
 use std::sync::atomic::Ordering::Relaxed;
 
 use hudhook::imgui::{Condition, Context, Io, Ui};
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
 use windows::Win32::Foundation::HINSTANCE;
-use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::config::{self, Config};
 use crate::state::{self, NetCommand, Q};
@@ -59,13 +57,7 @@ impl Overlay {
 
     /// Edge-detects the toggle key, only while this game window has focus (two copies can run side by side).
     fn poll_toggle(&mut self) {
-        // SAFETY: plain Win32 queries.
-        let focused = unsafe {
-            let mut pid = 0;
-            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
-            pid == GetCurrentProcessId()
-        };
-        let down = focused && unsafe { GetAsyncKeyState(self.vk as i32) } as u16 & 0x8000 != 0;
+        let down = crate::proxy::focused() && unsafe { GetAsyncKeyState(self.vk as i32) } as u16 & 0x8000 != 0;
         if down && !self.key_was_down {
             self.visible = !self.visible;
             state::OVERLAY_VISIBLE.store(self.visible, Relaxed);
@@ -103,6 +95,7 @@ impl ImguiRenderLoop for Overlay {
     }
 
     fn before_render(&mut self, ctx: &mut Context, _: &mut dyn RenderContext) {
+        crate::proxy::keep_running_unfocused();
         self.poll_toggle();
         // The game hides the system cursor; draw ImGui's own while the menu is open.
         ctx.io_mut().mouse_draw_cursor = self.visible;
@@ -172,6 +165,10 @@ impl Overlay {
         ui.text("Status:");
         ui.same_line();
         ui.text_colored(if net.connected { GREEN } else { GREY }, &net.state);
+        if net.connected {
+            ui.same_line();
+            ui.text_colored(GREY, format!("(this copy: {:?})", state::role()));
+        }
         if let Some(e) = &net.last_error {
             ui.text_colored(RED, "Error:");
             ui.same_line();
@@ -187,6 +184,14 @@ impl Overlay {
             }
             if let Some(es) = &info.enemy {
                 enemy_stats(ui, es);
+            }
+            if state::role() == state::Role::Client {
+                let mut follow = state::FOLLOW_HOST.load(Relaxed);
+                if ui.checkbox("Follow host", &mut follow) {
+                    state::FOLLOW_HOST.store(follow, Relaxed);
+                }
+                ui.same_line();
+                ui.text_colored(GREY, "(testing alone with two copies: your 2B copies the host and stays beside them)");
             }
             if ui.button("Disconnect") {
                 let _ = Q.net_cmds.push(NetCommand::Disconnect);

@@ -38,6 +38,19 @@ mod patterns {
     pub const POD_PROGRAM: &str = "4C 8B DC 57 48 81 EC A0 01 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 50 01 00 00 83 B9 60 5B 01 00 00";
     /// Referenced right before `lea rcx,[camera_game]` (AutomataMP `CameraGame.cpp`).
     pub const CAMERA_STRING: &str = "Step : %d / %d";
+    /// Start of `Action::request_state(this, &StateReq) -> bool`, through which every scripted scene action
+    /// (cutscenes included) changes state. nier_coop `src/sdk/mod.rs` `REQUEST_STATE`.
+    pub const REQUEST_STATE: &str = "48 89 5C 24 10 57 48 83 EC 30 48 8B D9 48 8B FA 8B 0A 39 4B 20";
+    /// Flag update, then `lea rcx,[action_scene]; call save_scene` (the `lea` is at +0x14). nier_coop
+    /// `ACTION_SCENE`.
+    pub const ACTION_SCENE: &str = "8B 05 ? ? ? ? 0F BA F0 1C 0F BA E8 1E 89 05 ? ? ? ? 48 8D 0D ? ? ? ? E8";
+    /// Start of the scene signal queue push `post(queue, &sender, &signal)`, called at +0x53 in the
+    /// `Action.signal` native (which loads the queue with `lea rcx` at +0x48). nier_coop `SIGNAL_POST`.
+    pub const SIGNAL_POST: &str = "48 8B C4 56 57 41 56 48 83 EC 50 48 C7 40 B8 FE FF FF FF 48 89 58 10";
+    /// `SceneStateSystem.set(&sys, &intern(hash(s), s))` on a literal, then `release(&s)`. From the start: hash
+    /// call, +0x14 `lea rcx,[pool]`, +0x1B intern call, +0x28 `lea rcx,[sys]`, +0x2F set call, +0x39 release
+    /// call. The match whose set call goes to the `SceneStateSystem.set` native is used. nier_coop `SCENE_SET_SITE`.
+    pub const SCENE_SET_SITE: &str = "E8 ? ? ? ? 41 B9 ? 00 00 00 4C 8D 05 ? ? ? ? 8B D0 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 89 45 ? 48 8D 55 ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 90 48 8D 4D ? E8";
 }
 
 /// Bytes a hook overwrites (ilhook always writes a 14-byte absolute jmp; retour writes at most that).
@@ -82,6 +95,45 @@ pub struct Addresses {
     pub em_start_animation: usize,
     /// Global `CameraGame` object.
     pub camera: usize,
+    /// `Action::request_state(this, &StateReq) -> bool` (hooked: cutscene sync).
+    pub request_state: usize,
+    /// Static `ActionScene`: every loaded scene action group.
+    pub action_scene: usize,
+    /// `hap::PhaseEventAction` vtable: the cutscene action class.
+    pub phase_event_vtable: usize,
+    /// `hap::CameraAction` vtable: scripted camera events ("mini cutscenes", e.g. an enemy wave's intro).
+    pub camera_action_vtable: usize,
+    /// `StateReq* build(StateReq* out, u32 hash)`: fills a state request with the hash's registered name
+    /// (+1 ref on the name). The call at +0x77 in the `PhaseEventAction.load` native (nier_coop `resolve_signal`).
+    pub state_req_build: usize,
+    /// `bool post(queue, const Sender*, const StateReq*)`: every scene signal (hooked: signal sync).
+    pub signal_post: usize,
+    /// The scene signal queue passed to `signal_post`.
+    pub signal_queue: usize,
+    /// `hap::SendCommand` vtable (commands to entities: blow up debris, open doors).
+    pub send_command_vtable: usize,
+    /// `hap::HapGoalLocationAction` vtable (quest objectives).
+    pub goal_vtable: usize,
+    /// `hap::EnemySetArea` vtable (area-triggered enemy sets).
+    pub enemy_set_vtable: usize,
+    /// `hap::EnemySetAction` and `hap::PlayerCombatLimitAction` vtables: script-started steps of a scripted scene
+    /// (an enemy wave and the player's event lock) that start in the same frame as its camera event. Mirrored from
+    /// the host: without them the client's camera event was accepted but never took the camera (2026-11-22).
+    pub enemy_set_action_vtable: usize,
+    pub combat_limit_vtable: usize,
+    /// `hap::AreaAction` vtable: area triggers (the player walked in). A scripted scene starts from one; the
+    /// client's player is not inside the host's, so its states are mirrored too.
+    pub area_action_vtable: usize,
+    /// Quest sync: the `SceneStateSystem.set` / `.reset` natives, the static system, and the string pool calls the
+    /// game uses around them: `u32 hash(const char*, len)`, `HashedStr* intern(pool, hash, const char*, len)` (+1
+    /// ref), `release(HashedStr**)`.
+    pub scene_set: usize,
+    pub scene_reset: usize,
+    pub scene_states: usize,
+    pub str_pool: usize,
+    pub str_hash: usize,
+    pub str_intern: usize,
+    pub str_release: usize,
 }
 
 impl Addresses {
@@ -171,8 +223,52 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         img.insn_target(lea)
     })())?;
 
+    let request_state = ctx("request_state", img.find_unique_code("pattern", &pat(patterns::REQUEST_STATE)))?;
+    let action_scene = ctx("action_scene", (|| {
+        let at = img.find_unique_code("pattern", &pat(patterns::ACTION_SCENE))?;
+        img.insn_target(at + 0x14)
+    })())?;
+    let phase_event_vtable = ctx("PhaseEventAction vtable", rtti::find_vtable(img, "PhaseEventAction@hap"))?;
+    let camera_action_vtable = ctx("CameraAction vtable", rtti::find_vtable(img, "CameraAction@hap"))?;
+    let state_req_build = ctx("state_req_build", (|| {
+        let call = native(img, "PhaseEventAction.load")? + 0x77;
+        if img.bytes.get(call) != Some(&0xE8) {
+            return err(format!("no call at PhaseEventAction.load+0x77 ({call:#x})"));
+        }
+        img.insn_target(call)
+    })())?;
+    let (signal_post, signal_queue) = ctx("signal_post", (|| {
+        let signal = native(img, "Action.signal")?;
+        if img.bytes.get(signal + 0x53) != Some(&0xE8) || img.bytes.get(signal + 0x48..signal + 0x4B) != Some(&[0x48, 0x8D, 0x0D][..]) {
+            return err("unexpected code in Action.signal");
+        }
+        let post = img.insn_target(signal + 0x53)?;
+        if !pat(patterns::SIGNAL_POST).matches_at(&img.bytes, post) {
+            return err(format!("post at {post:#x} does not match"));
+        }
+        Ok((post, img.insn_target(signal + 0x48)?))
+    })())?;
+    let send_command_vtable = ctx("SendCommand vtable", rtti::find_vtable(img, "SendCommand@hap"))?;
+    let goal_vtable = ctx("HapGoalLocationAction vtable", rtti::find_vtable(img, "HapGoalLocationAction@hap"))?;
+    let enemy_set_vtable = ctx("EnemySetArea vtable", rtti::find_vtable(img, "EnemySetArea@hap"))?;
+    let enemy_set_action_vtable = ctx("EnemySetAction vtable", rtti::find_vtable(img, "EnemySetAction@hap"))?;
+    let combat_limit_vtable = ctx("PlayerCombatLimitAction vtable", rtti::find_vtable(img, "PlayerCombatLimitAction@hap"))?;
+    let area_action_vtable = ctx("AreaAction vtable", rtti::find_vtable(img, "AreaAction@hap"))?;
+    let (scene_set, scene_reset) =
+        (ctx("scene_set", native(img, "SceneStateSystem.set"))?, ctx("scene_reset", native(img, "SceneStateSystem.reset"))?);
+    let [scene_states, str_pool, str_hash, str_intern, str_release] = ctx("scene set site", (|| {
+        let p = pat(patterns::SCENE_SET_SITE);
+        let at = p
+            .find_all(&img.bytes)
+            .find(|&i| img.insn_target(i + 0x2F).ok() == Some(scene_set))
+            .ok_or(ScanError("no call site of SceneStateSystem.set".into()))?;
+        Ok([img.insn_target(at + 0x28)?, img.insn_target(at + 0x14)?, img.insn_target(at)?, img.insn_target(at + 0x1B)?, img.insn_target(at + 0x39)?])
+    })())?;
+
     // Every patched site must be safe to overwrite.
     for (name, site) in [
+        ("request_state", request_state),
+        ("signal_post", signal_post),
         ("update", update),
         ("spawn", spawn),
         ("held_store", held_store),
@@ -202,7 +298,38 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         em_base_vtable,
         em_start_animation,
         camera,
+        request_state,
+        action_scene,
+        phase_event_vtable,
+        camera_action_vtable,
+        state_req_build,
+        signal_post,
+        signal_queue,
+        send_command_vtable,
+        goal_vtable,
+        enemy_set_vtable,
+        enemy_set_action_vtable,
+        combat_limit_vtable,
+        area_action_vtable,
+        scene_set,
+        scene_reset,
+        scene_states,
+        str_pool,
+        str_hash,
+        str_intern,
+        str_release,
     })
+}
+
+/// Number of addresses in [`Addresses`] (for the startup log).
+pub const COUNT: usize = 38;
+
+/// A script native's function. Each one is registered by a static initializer that loads it with
+/// `lea rax,[native]` right before `lea rcx,[name]`.
+fn native(img: &Image, name: &str) -> Result<usize> {
+    let r = *img.string_refs(name)?.first().ok_or(ScanError(format!("{name}: no reference")))?;
+    let init = img.function_at(r)?.begin;
+    img.insn_target(img.find_insn(init, 4, &pat("48 8D 05"))?)
 }
 
 #[cfg(test)]
@@ -219,7 +346,13 @@ pub(crate) mod tests {
     /// Resolved there: entity_list 0x1029860, possessed 0x12505dc, update 0x7b4d00, spawn 0x745af0, spawner
     /// 0x1029898, routine 0x3ec540, scripts 0xfc9888, held_store 0x52a7aa, pod_no_target 0x48b943, aim copy
     /// 0x48b992, pod_program 0x529080, Pl0000 vtable 0xc61628, start_animation 0x433c70, camera 0x1020bb0,
-    /// EmBase vtable 0xc79d78, em_start_animation 0x637970 (added 2026-11-22, same exe).
+    /// EmBase vtable 0xc79d78, em_start_animation 0x637970 (added 2026-11-22, same exe), request_state 0x3ec650,
+    /// action_scene 0xfca888, PhaseEventAction vtable 0xc40758 (added 2026-11-22, same exe; equal to what
+    /// nier_coop's events.rs test pins for its 2026-11-19 exe), CameraAction vtable 0xc40b60, state_req_build
+    /// 0x3cffb0 (added 2026-11-22, same exe; build equals nier_coop's). World sync, same exe, all equal to
+    /// nier_coop's: signal_post 0x34cab0, signal_queue 0xfca918, SendCommand 0xc46d70, HapGoalLocationAction
+    /// 0xc4ce60, EnemySetArea 0xc40458, scene_set 0x354b20, scene_reset 0x34f8e0, scene_states 0xfc2680, str_pool
+    /// 0xf8c4e0, str_hash 0x28ee30, str_intern 0x150e70, str_release 0x150c60.
     /// The first nine match what nier_coop resolved at runtime on the same exe (its log, module base
     /// 0x7ff661fc0000).
     const EXPECTED_BUILD: u32 = 0x6ac8_9519;
@@ -243,7 +376,26 @@ pub(crate) mod tests {
             ("pod_program", a.pod_program),
             ("start_animation", a.start_animation),
             ("em_start_animation", a.em_start_animation),
+            ("request_state", a.request_state),
         ] {
+            assert_eq!(img.function_at(f).unwrap().begin, f, "{n} is not a function start");
+        }
+        // Cutscene sync (added 2026-11-22): the action scene is data, its class vtable a real hap:: class.
+        assert!(!img.is_code(a.action_scene));
+        let phase = rtti::class_hierarchy(&img, a.phase_event_vtable).unwrap();
+        assert_eq!(phase.first().map(String::as_str), Some(".?AVPhaseEventAction@hap@@"));
+        let camera = rtti::class_hierarchy(&img, a.camera_action_vtable).unwrap();
+        assert_eq!(camera.first().map(String::as_str), Some(".?AVCameraAction@hap@@"));
+        assert_eq!(img.function_at(a.state_req_build).unwrap().begin, a.state_req_build, "state_req_build is not a function start");
+        // World sync (added 2026-11-22): what nier_coop's events.rs / quest.rs tests pin for its 2026-11-19 exe.
+        assert_eq!((a.signal_post, a.signal_queue), (0x34cab0, 0xfca918));
+        assert_eq!((a.send_command_vtable, a.goal_vtable, a.enemy_set_vtable), (0xc46d70, 0xc4ce60, 0xc40458));
+        assert_eq!(a.scene_set, 0x354b20);
+        // The session log shows these classes at vt+0xc403c0 and vt+0xc41b08.
+        assert_eq!((a.enemy_set_action_vtable, a.combat_limit_vtable), (0xc403c0, 0xc41b08));
+        assert_eq!(a.area_action_vtable, 0xc4c538); // "AreaAction@hap (vt+0xc4c538)" in the session log
+        assert_eq!([a.scene_states, a.str_pool, a.str_hash, a.str_intern, a.str_release], [0xfc2680, 0xf8c4e0, 0x28ee30, 0x150e70, 0x150c60]);
+        for (n, f) in [("scene_reset", a.scene_reset), ("signal_post", a.signal_post)] {
             assert_eq!(img.function_at(f).unwrap().begin, f, "{n} is not a function start");
         }
         // Mid-function sites are what the hooks expect.
@@ -300,11 +452,7 @@ pub(crate) mod tests {
     fn enemy_natives() {
         let bytes = exe_image();
         let img = Image::new(&bytes, None).unwrap();
-        let native = |name: &str| {
-            let r = img.string_refs(name).unwrap()[0];
-            let init = img.function_at(r).unwrap().begin;
-            img.insn_target(img.find_insn(init, 4, &pat("48 8D 05")).unwrap()).unwrap()
-        };
+        let native = |name: &str| native(&img, name).unwrap();
         let code = |at: usize, n: usize| &img.bytes[at..at + n];
         // mov dword ptr [rcx+2C330h],1 / 0; ret
         assert_eq!(code(native("EmBase.onNoDieSuperArmor"), 11), [0xC7, 0x81, 0x30, 0xC3, 0x02, 0, 1, 0, 0, 0, 0xC3]);

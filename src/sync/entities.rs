@@ -58,6 +58,10 @@ const DIAG_EVERY_MS: f64 = 10_000.0;
 const MAX_DIAG_LOGS: u32 = 20;
 /// Host: HP 0 without a die state counts as a death only after this long (a boss can touch 0 between phases).
 const ZERO_HP_DEATH_MS: f64 = 1000.0;
+/// Host: with enemies around, a world this long without any change (no enemy or player moved by a single
+/// bit, no animation started) is paused (pause menu: our per-frame tick still runs). Nothing is sent then,
+/// so the client's own AI runs its enemies instead of freezing them mid-run (see `STALE_MS`).
+const PAUSE_DETECT_MS: f64 = 300.0;
 /// Client: a host entity waits this long for our own game to spawn its match before we spawn a copy.
 const PAIR_GRACE_MS: f64 = 2000.0;
 /// Client: our own networkable entity waits this long for a host match before it is removed.
@@ -71,6 +75,8 @@ const SPAWN_RETRY_MS: f64 = 1000.0;
 const SPAWNS_PER_TICK: usize = 4;
 /// Client: don't terminate the same entity again before this.
 const TERMINATE_RETRY_MS: f64 = 2000.0;
+/// Client: terminations of one of our own unmatched entities before it is left alone.
+const MAX_REMOVE_TRIES: u32 = 3;
 /// Client: without a host snapshot for this long (host loading, stalled), our own AI runs our enemies again.
 const STALE_MS: f64 = 1000.0;
 /// Client: our own hits stay on the shown HP this long at most, waiting for the host's HP to reflect them.
@@ -207,16 +213,34 @@ impl HpView {
     }
 }
 
-/// Client: which of our own candidates (positions of free entities of the right model) backs a host entity
-/// at `at`: the nearest within `PAIR_DIST`, or the nearest at any distance when it is the only one of its
-/// model on both sides (a boss can stand far from the host's after separate loads).
-fn pick(at: cVec4, unique: bool, cands: &[cVec4]) -> Option<usize> {
-    cands
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| unique || p.dist(at) <= PAIR_DIST)
-        .min_by(|a, b| a.1.dist(at).total_cmp(&b.1.dist(at)))
-        .map(|(i, _)| i)
+/// Client: which of our own free entities backs which host entity. `hosts` are (net id, model, host position),
+/// `cands` our free entities as (index, model, position). Same model only, within `PAIR_DIST`, or at any
+/// distance when it is the only one of its model on both sides (a boss can stand far from the host's after
+/// separate loads). Closest pairs first across all of a model: taking host entities one by one let an early
+/// one grab the entity right beside a later one (seen 2026-11-22: a wave of 8 paired up to 26 m apart).
+fn assign(hosts: &[(u32, u32, cVec4)], cands: &[(usize, u32, cVec4)]) -> Vec<(u32, usize)> {
+    let mut pairs: Vec<(f32, u32, usize)> = Vec::new();
+    for &(id, model, at) in hosts {
+        let unique = hosts.iter().filter(|h| h.1 == model).count() == 1 && cands.iter().filter(|c| c.1 == model).count() == 1;
+        for &(i, m, p) in cands {
+            let d = p.dist(at);
+            if m == model && (unique || d <= PAIR_DIST) {
+                pairs.push((d, id, i));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut used_h, mut used_c, mut out) = (HashSet::new(), HashSet::new(), Vec::new());
+    for (_, id, i) in pairs {
+        if used_h.insert(id) {
+            if used_c.insert(i) {
+                out.push((id, i));
+            } else {
+                used_h.remove(&id);
+            }
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------------------------------------------------
@@ -311,12 +335,33 @@ pub struct EntitySync {
     last_diag_ms: f64,
     diag_logs: u32,
     scan_logs: u32,
+    /// Pause detection: the last sent frame's state hash, when it stopped changing, any animation since.
+    last_sig: u64,
+    unchanged_since: Option<f64>,
+    anim_since_send: bool,
+    paused: bool,
     // Client
     mirrors: HashMap<u32, Mirror>,
     first_seen: HashMap<u32, f64>,
     terminated: HashMap<u32, f64>,
+    /// Our own unmatched entities: how often each was terminated, and the ones still there after
+    /// `MAX_REMOVE_TRIES` (left alone: seen 2026-11-22, an em0050 survived termination every 2 s for minutes).
+    remove_tries: HashMap<u32, u32>,
+    unremovable: HashSet<u32>,
+    /// Client: copies we spawned, until they leave the entity list. Never "our own" entities: a replaced copy
+    /// lingers a moment after termination and was paired with another host entity 37 m away (2026-11-22).
+    copies: HashSet<u32>,
     last_batch_ms: f64,
+    /// Whether host snapshots were fresh last tick (logged on change).
+    was_fresh: bool,
     refused_logged: HashSet<(usize, u32)>,
+    /// Client: host entities whose animation arrived with nothing here to play it on (logged once each).
+    anim_dropped_logged: HashSet<u32>,
+    /// Animations sent (host) or played (client) per net id since the last report, its name, and when that was.
+    /// Shows whether an enemy's attacks reach the client (2026-11-22: a mini boss attacked only on the host).
+    anim_counts: HashMap<u32, u32>,
+    names: HashMap<u32, String>,
+    last_anim_report_ms: f64,
     stats: EnemyStats,
 }
 
@@ -409,6 +454,14 @@ impl EntitySync {
         if self.by_handle.contains_key(&handle) {
             return;
         }
+        // As in the snapshots: only position and yaw are ours to vouch for. One non-finite value makes the
+        // client reject the event, and a rejected event ends the session (seen in-game 2026-11-22: "non-finite
+        // spawn transform"). Not announced now; the next entity-list scan retries it.
+        s.pos = cVec4::new(s.pos.x, s.pos.y, s.pos.z, 1.0);
+        s.rot = cVec4::new(0.0, s.rot.y, 0.0, 0.0);
+        if !(s.pos.is_sane() && s.rot.is_sane()) {
+            return;
+        }
         if s.name.is_empty() || !s.name.bytes().all(|b| b.is_ascii_graphic()) {
             // Many enemies have an empty entity name (seen in-game 2026-11-22: model 0x20052). The spawn
             // function only uses the name as a label (AutomataMP spawns enemies as "FreeEnemy"); the model
@@ -418,6 +471,8 @@ impl EntitySync {
         let id = self.next_id;
         self.next_id += 1;
         s.net_id = id;
+        tracing::info!("enemy sync (host): sending {} (model {:#x}, handle {handle:#x}) as {id}", s.name, s.model);
+        self.names.insert(id, s.name.clone());
         self.owned.insert(id, Owned { handle, dead: false, zero_hp_since: None, last_anim: None });
         self.by_handle.insert(handle, id);
         state::send_event(Event::SpawnEntity(s));
@@ -431,6 +486,7 @@ impl EntitySync {
             Event::SpawnEntity(s) => {
                 if !self.mirrors.contains_key(&s.net_id) {
                     let id = s.net_id;
+                    self.names.insert(id, s.name.clone());
                     let m = Mirror {
                         spawn: s,
                         waiting_since_ms: now,
@@ -447,10 +503,17 @@ impl EntitySync {
             }
             Event::EntityAnim { net_id, args } => {
                 let Some(m) = self.mirrors.get(&net_id).filter(|m| !m.dead) else { return };
-                if let Some((h, _)) = m.local
-                    && let Some((b, true)) = networkable(h)
-                {
-                    self.replay(b, args);
+                match m.local.and_then(|(h, _)| networkable(h)) {
+                    Some((b, true)) => {
+                        *self.anim_counts.entry(net_id).or_insert(0) += 1;
+                        self.replay(b, args)
+                    }
+                    other => {
+                        if self.anim_dropped_logged.insert(net_id) {
+                            let why = if other.is_some() { "its backing entity is not an EmBase" } else { "nothing backs it here yet" };
+                            tracing::info!("enemy sync: host animation {:#x} for {} ({net_id}) not played: {why}", args[0], m.spawn.name);
+                        }
+                    }
                 }
             }
             Event::EntityDied { net_id } => {
@@ -468,6 +531,7 @@ impl EntitySync {
                     if !m.dead
                         && let Some((b, _)) = networkable(h)
                     {
+                        tracing::info!("enemy sync: host destroyed {} (net id {net_id}) while it was alive; removing ours", m.spawn.name);
                         unblock(b);
                         world::terminate(b);
                     }
@@ -523,6 +587,27 @@ impl EntitySync {
             Some(Role::Client) => self.tick_client(now, dt),
             _ => {}
         }
+        self.report_anims(now);
+    }
+
+    /// Every 10 s while enemies animate: the busiest enemies' animation counts (host: sent, client: played).
+    fn report_anims(&mut self, now: f64) {
+        if now - self.last_anim_report_ms < 10_000.0 {
+            return;
+        }
+        self.last_anim_report_ms = now;
+        if self.anim_counts.is_empty() {
+            return;
+        }
+        let mut v: Vec<(u32, u32)> = self.anim_counts.drain().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let what = if self.role == Some(Role::Host) { "sent" } else { "played" };
+        let list: Vec<String> = v
+            .iter()
+            .take(10)
+            .map(|(id, n)| format!("{} ({id}) {n}", self.names.get(id).map_or("?", String::as_str)))
+            .collect();
+        tracing::info!("enemy sync: animations {what} in the last 10 s: {}", list.join(", "));
     }
 
     fn tick_host(&mut self, now: f64) {
@@ -552,6 +637,8 @@ impl EntitySync {
                 && o.last_anim.is_none_or(|(last, t)| last != args || now - t >= ANIM_REPEAT_MS)
             {
                 o.last_anim = Some((args, now));
+                self.anim_since_send = true;
+                *self.anim_counts.entry(id).or_insert(0) += 1;
                 state::send_event(Event::EntityAnim { net_id: id, args });
             }
         }
@@ -592,8 +679,15 @@ impl EntitySync {
         for id in gone {
             if let Some(o) = self.owned.remove(&id) {
                 self.by_handle.remove(&o.handle);
+                if !o.dead {
+                    tracing::info!("enemy sync (host): entity {id} left the entity list while alive; telling the client to remove it");
+                }
             }
             state::send_event(Event::DestroyEntity { net_id: id });
+        }
+        self.stats.tracked = self.owned.values().filter(|o| !o.dead).count();
+        if self.detect_pause(&items, now) {
+            return;
         }
         // An empty batch still goes out: it tells the client the host is alive and has nothing to update.
         let chunks: Vec<&[EntityState]> = if items.is_empty() { vec![&[]] } else { items.chunks(protocol::ENTITIES_PER_DATAGRAM).collect() };
@@ -602,7 +696,26 @@ impl EntitySync {
             let d = Datagram::Entities { seq: self.seq, time_ms: now as u32, items: chunk.to_vec() };
             let _ = Q.out_datagrams.force_push(d);
         }
-        self.stats.tracked = self.owned.values().filter(|o| !o.dead).count();
+    }
+
+    /// Host: true while our world is paused (see `PAUSE_DETECT_MS`). Logs each change.
+    fn detect_pause(&mut self, items: &[EntityState], now: f64) -> bool {
+        let player = world::player().map(|(_, p)| unsafe { addr_of!((*p).base.position).read() }); // SAFETY: validated Pl0000
+        let sig = frame_signature(items, player);
+        let still = !items.is_empty() && !self.anim_since_send && sig == self.last_sig;
+        self.anim_since_send = false;
+        self.last_sig = sig;
+        let since = if still { *self.unchanged_since.get_or_insert(now) } else { self.unchanged_since.take(); now };
+        let paused = now - since >= PAUSE_DETECT_MS;
+        if paused != self.paused {
+            self.paused = paused;
+            if paused {
+                tracing::info!("enemy sync (host): world paused; enemy updates held so the client's AI takes over");
+            } else {
+                tracing::info!("enemy sync (host): world running again; sending enemy updates");
+            }
+        }
+        paused
     }
 
     fn tick_client(&mut self, now: f64, dt: f32) {
@@ -623,10 +736,15 @@ impl EntitySync {
         // Our own entities that back nothing yet. Corpses are never paired or removed: they finish dying.
         self.terminated.retain(|_, t| now - *t < TERMINATE_RETRY_MS);
         self.first_seen.retain(|h, _| present.contains_key(h));
+        self.copies.retain(|h| present.contains_key(h));
         let mut free: Vec<usize> = (0..locals.len())
             .filter(|&i| {
                 let l = &locals[i];
-                l.hp > 0 && !self.by_handle.contains_key(&l.handle) && !self.terminated.contains_key(&l.handle)
+                l.hp > 0
+                    && !self.by_handle.contains_key(&l.handle)
+                    && !self.terminated.contains_key(&l.handle)
+                    && !self.unremovable.contains(&l.handle)
+                    && !self.copies.contains(&l.handle)
             })
             .collect();
         for &i in &free {
@@ -634,21 +752,13 @@ impl EntitySync {
         }
 
         // Pair host entities with our own (also replacing a copy we spawned earlier).
-        let wanting: Vec<u32> = self.mirrors.iter().filter(|(_, m)| m.wants_pair()).map(|(&id, _)| id).collect();
-        for id in wanting {
-            let (model, at) = {
-                let m = &self.mirrors[&id];
-                (m.spawn.model, m.host_pos())
-            };
-            let same: Vec<usize> = free.iter().copied().filter(|&i| locals[i].model == model).collect();
-            if same.is_empty() {
-                continue;
-            }
-            let host_same = self.mirrors.values().filter(|m| m.wants_pair() && m.spawn.model == model).count();
-            let cands: Vec<cVec4> = same.iter().map(|&i| locals[i].pos).collect();
-            let Some(k) = pick(at, host_same == 1 && same.len() == 1, &cands) else { continue };
-            let l = &locals[same[k]];
-            free.retain(|&i| i != same[k]);
+        let wanting: Vec<(u32, u32, cVec4)> =
+            self.mirrors.iter().filter(|(_, m)| m.wants_pair()).map(|(&id, m)| (id, m.spawn.model, m.host_pos())).collect();
+        let cands: Vec<(usize, u32, cVec4)> = free.iter().map(|&i| (i, locals[i].model, locals[i].pos)).collect();
+        for (id, li) in assign(&wanting, &cands) {
+            let at = self.mirrors[&id].host_pos();
+            let l = &locals[li];
+            free.retain(|&i| i != li);
             let m = self.mirrors.get_mut(&id).expect("id from the map");
             if let Some((old, Backing::Copy)) = m.local {
                 self.by_handle.remove(&old);
@@ -658,6 +768,7 @@ impl EntitySync {
                 }
                 tracing::info!("enemy sync: replaced the copy of {} with our own", m.spawn.name);
             }
+            tracing::info!("enemy sync: {} ({id}) paired with our own (handle {:#x}, {:.0} m away)", m.spawn.name, l.handle, l.pos.dist(at));
             m.local = Some((l.handle, Backing::Paired));
             m.hp = HpView::default();
             self.by_handle.insert(l.handle, id);
@@ -680,6 +791,8 @@ impl EntitySync {
             let rot = m.target.map_or(m.spawn.rot, |t| t.rot);
             match spawn_copy(&m.spawn, m.host_pos(), rot) {
                 Some((h, b, em)) => {
+                    self.copies.insert(h);
+                    tracing::info!("enemy sync: spawned a copy of {} ({id}, handle {h:#x}, EmBase {em})", m.spawn.name);
                     m.local = Some((h, Backing::Copy));
                     m.hp = HpView::default();
                     self.by_handle.insert(h, id);
@@ -698,17 +811,39 @@ impl EntitySync {
         }
 
         // Remove our own entities the host has no match for.
+        self.remove_tries.retain(|h, _| present.contains_key(h));
+        self.unremovable.retain(|h| present.contains_key(h));
+        let mut removed = Vec::new();
         for &i in &free {
             let l = &locals[i];
             if self.first_seen.get(&l.handle).is_some_and(|&t| now - t >= LOCAL_GRACE_MS) {
+                let tries = self.remove_tries.entry(l.handle).or_insert(0);
+                if *tries >= MAX_REMOVE_TRIES {
+                    tracing::warn!("enemy sync: our {} ({:#x}) survives removal; left alone", fallback_name(l.model), l.handle);
+                    self.unremovable.insert(l.handle);
+                    continue;
+                }
+                *tries += 1;
                 world::terminate(l.b);
                 self.terminated.insert(l.handle, now);
                 self.stats.removed += 1;
+                removed.push(format!("{} ({:#x})", fallback_name(l.model), l.handle));
             }
+        }
+        if !removed.is_empty() {
+            tracing::info!("enemy sync: removed {} of our own entities the host has no match for: {}", removed.len(), removed.join(", "));
         }
 
         // Drive the backing entities from the host's snapshots.
         let fresh = now - self.last_batch_ms < STALE_MS;
+        if fresh != self.was_fresh && !self.mirrors.is_empty() {
+            if fresh {
+                tracing::info!("enemy sync: host updates resumed; the host's AI drives our enemies again");
+            } else {
+                tracing::info!("enemy sync: no host update for {} ms; our own AI runs our enemies", STALE_MS);
+            }
+        }
+        self.was_fresh = fresh;
         let mut blocked = HashSet::new();
         let (mut paired, mut copies, mut waiting, mut no_updates) = (0, 0, 0, 0);
         for m in self.mirrors.values_mut().filter(|m| !m.dead) {
@@ -759,6 +894,18 @@ impl EntitySync {
 /// (0x20052 -> "em0052"), matching the game's own enemy naming.
 fn fallback_name(model: u32) -> String {
     format!("em{:04x}", model & 0xFFFF)
+}
+
+/// Host: exact bits of everything sent this frame plus the local player's position; equal hashes on
+/// consecutive frames mean nothing in the world moved.
+fn frame_signature(items: &[EntityState], player: Option<cVec4>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in items {
+        (s.net_id, s.pos.x.to_bits(), s.pos.y.to_bits(), s.pos.z.to_bits(), s.rot.y.to_bits(), s.hp).hash(&mut h);
+    }
+    player.map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())).hash(&mut h);
+    h.finish()
 }
 
 /// Client: the host's enemy died; ours dies the way the scripts kill an enemy, so our quest scripts follow.
@@ -828,6 +975,15 @@ mod tests {
     }
 
     #[test]
+    fn frame_signature_changes_only_when_something_moves() {
+        let s = |x: f32| EntityState { net_id: 1, pos: cVec4::new(x, 0.0, 0.0, 1.0), rot: cVec4::default(), hp: 10 };
+        let p = Some(cVec4::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(frame_signature(&[s(1.0)], p), frame_signature(&[s(1.0)], p));
+        assert_ne!(frame_signature(&[s(1.0)], p), frame_signature(&[s(1.0001)], p)); // an enemy moved
+        assert_ne!(frame_signature(&[s(1.0)], p), frame_signature(&[s(1.0)], Some(cVec4::new(0.1, 0.0, 0.0, 1.0)))); // player moved
+    }
+
+    #[test]
     fn unnamed_entities_get_a_name_the_client_accepts() {
         assert_eq!(fallback_name(0x20052), "em0052");
         let e = Event::SpawnEntity(SpawnEntity { net_id: 1, name: fallback_name(0x21020), model: 0x21020, pos: cVec4::default(), rot: cVec4::default() });
@@ -836,13 +992,20 @@ mod tests {
 
     #[test]
     fn pairs_nearest_in_range_or_a_unique_one_anywhere() {
-        let at = cVec4::new(0.0, 0.0, 0.0, 1.0);
-        let near = cVec4::new(10.0, 0.0, 0.0, 1.0);
-        let nearer = cVec4::new(5.0, 0.0, 0.0, 1.0);
-        let far = cVec4::new(500.0, 0.0, 0.0, 1.0);
-        assert_eq!(pick(at, false, &[near, nearer, far]), Some(1));
-        assert_eq!(pick(at, false, &[far]), None);
-        assert_eq!(pick(at, true, &[far]), Some(0)); // a boss after separate loads
-        assert_eq!(pick(at, false, &[]), None);
+        let p = |x: f32| cVec4::new(x, 0.0, 0.0, 1.0);
+        assert_eq!(assign(&[(1, 7, p(0.0))], &[(0, 7, p(10.0)), (1, 7, p(5.0)), (2, 7, p(500.0))]), vec![(1, 1)]);
+        assert_eq!(assign(&[(1, 7, p(0.0))], &[(0, 7, p(500.0)), (1, 7, p(600.0))]), vec![]); // two, both far
+        assert_eq!(assign(&[(1, 7, p(0.0))], &[(0, 7, p(500.0))]), vec![(1, 0)]); // a boss after separate loads
+        assert_eq!(assign(&[(1, 7, p(0.0))], &[(0, 8, p(0.0))]), vec![]); // other model
+        assert_eq!(assign(&[(1, 7, p(0.0))], &[]), vec![]);
+    }
+
+    #[test]
+    fn pairs_closest_first_across_a_wave() {
+        let p = |x: f32| cVec4::new(x, 0.0, 0.0, 1.0);
+        // Host 1 at 0, host 2 at 20; ours at 19 and 21. Host 1 one-by-one would take 19 (closest to it), leaving
+        // host 2 with 21: fine. The bad case: host 1 at 10 takes ours at 19 (9 m) before host 2 at 19 gets it.
+        let got = assign(&[(1, 7, p(10.0)), (2, 7, p(19.0))], &[(0, 7, p(19.0)), (1, 7, p(1.0))]);
+        assert!(got.contains(&(2, 0)) && got.contains(&(1, 1)), "{got:?}");
     }
 }
