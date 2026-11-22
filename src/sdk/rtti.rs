@@ -77,6 +77,26 @@ pub fn find_vtable(img: &Image, class: &str) -> Result<usize> {
     Ok(meta + 8)
 }
 
+/// Every primary vtable in the image with its class chain (most-derived first). Slow: a full scan of the
+/// data sections, for offline tests.
+#[cfg(test)]
+pub fn all_vtables(img: &Image) -> Vec<(usize, Vec<String>)> {
+    let mut out = Vec::new();
+    for s in img.sections.iter().filter(|s| !s.is_code()) {
+        let end = (s.rva + s.size).min(img.bytes.len()).saturating_sub(16);
+        for at in (s.rva..end).step_by(8) {
+            let Ok(col) = img.u64_at(at).and_then(|p| img.rva_of_ptr(p)) else { continue };
+            let is_primary_col = img.u32_at(col).ok() == Some(1)
+                && img.u32_at(col + 4).ok() == Some(0)
+                && img.u32_at(col + 0x14).ok().map(|x| x as usize) == Some(col);
+            if is_primary_col && let Ok(chain) = class_hierarchy(img, at + 8) {
+                out.push((at + 8, chain));
+            }
+        }
+    }
+    out
+}
+
 /// RVA of the function in vtable slot `index`.
 pub fn vtable_slot(img: &Image, vtable: usize, index: usize) -> Result<usize> {
     let f = img.rva_of_ptr(img.u64_at(vtable + 8 * index)?)?;

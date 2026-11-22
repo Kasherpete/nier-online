@@ -58,6 +58,7 @@ pub fn tick() {
                 st.player.reset();
                 if enemy_sync && role != Role::None {
                     st.entities.start(role);
+                    st.entities.set_replay_unverified(crate::config::get().enemy_replay_unverified);
                 }
             }
             GameCommand::SessionEnded => {
@@ -72,13 +73,15 @@ pub fn tick() {
         st.player.on_snapshot(r.at_ms, r.value);
     }
     while let Some(r) = Q.in_entities.pop() {
-        st.entities.on_batch(r.value);
+        st.entities.on_batch(r.at_ms, r.value);
     }
     while let Some(e) = Q.in_events.pop() {
         match e {
             Event::Anim { time_ms, args } => st.player.timeline.push_event(time_ms, RemoteEvent::Anim(args)),
             Event::Buttons { time_ms, buttons } => st.player.timeline.push_event(time_ms, RemoteEvent::Buttons(buttons)),
-            e @ (Event::SpawnEntity(_) | Event::DestroyEntity { .. } | Event::HitRequest { .. }) => st.entities.on_event(e),
+            e @ (Event::SpawnEntity(_) | Event::EntityAnim { .. } | Event::EntityDied { .. } | Event::DestroyEntity { .. }) => {
+                st.entities.on_event(e, now)
+            }
             _ => {}
         }
     }
@@ -115,6 +118,7 @@ fn publish_overlay(st: &mut SyncState, now: f64) {
         o.entities = l;
     }
     o.inspect = inspect;
+    o.enemy = (st.active && st.enemy_sync).then(|| st.entities.stats());
 }
 
 fn entity_list(es: &EntitySync) -> Vec<EntityInfo> {
@@ -134,7 +138,7 @@ fn entity_list(es: &EntitySync) -> Vec<EntityInfo> {
                 class: class.short_name(),
                 pos: [pos.x, pos.y, pos.z],
                 hp,
-                net_id: es.net_id_of(h),
+                net: es.net_id_of(h),
             })
         })
         .collect()

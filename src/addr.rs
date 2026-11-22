@@ -75,6 +75,11 @@ pub struct Addresses {
     pub pl0000_vtable: usize,
     /// `Pl0000::start_animation` (vtable slot 18).
     pub start_animation: usize,
+    /// Primary `EmBase` vtable (every enemy class derives from it).
+    pub em_base_vtable: usize,
+    /// `EmBase::start_animation` (vtable slot 18), shared by all 34 enemy classes on build 7788: each one's
+    /// slot 18 is this function, a `jmp` to it, or a wrapper that calls it.
+    pub em_start_animation: usize,
     /// Global `CameraGame` object.
     pub camera: usize,
 }
@@ -157,6 +162,9 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
     let pl0000_vtable = ctx("Pl0000 vtable", rtti::find_vtable(img, "Pl0000"))?;
     let start_animation =
         ctx("start_animation", rtti::vtable_slot(img, pl0000_vtable, sdk::START_ANIMATION_INDEX))?;
+    let em_base_vtable = ctx("EmBase vtable", rtti::find_vtable(img, "EmBase"))?;
+    let em_start_animation =
+        ctx("em_start_animation", rtti::vtable_slot(img, em_base_vtable, sdk::START_ANIMATION_INDEX))?;
 
     let camera = ctx("camera", (|| {
         let lea = after_string_ref(img, patterns::CAMERA_STRING, 100, "48 8D 0D")?;
@@ -170,6 +178,7 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         ("held_store", held_store),
         ("pod_no_target", pod_no_target),
         ("start_animation", start_animation),
+        ("em_start_animation", em_start_animation),
     ] {
         ctx(&format!("hook site {name}"), img.check_hook_site(site, HOOK_PATCH_LEN))?;
     }
@@ -190,6 +199,8 @@ pub fn resolve(img: &Image, base: usize) -> Result<Addresses> {
         pod_program,
         pl0000_vtable,
         start_animation,
+        em_base_vtable,
+        em_start_animation,
         camera,
     })
 }
@@ -207,7 +218,8 @@ pub(crate) mod tests {
     /// Exe these RVAs were verified against: Steam `Last_SVN_REVISION=7788`, file dated 2026-11-21.
     /// Resolved there: entity_list 0x1029860, possessed 0x12505dc, update 0x7b4d00, spawn 0x745af0, spawner
     /// 0x1029898, routine 0x3ec540, scripts 0xfc9888, held_store 0x52a7aa, pod_no_target 0x48b943, aim copy
-    /// 0x48b992, pod_program 0x529080, Pl0000 vtable 0xc61628, start_animation 0x433c70, camera 0x1020bb0.
+    /// 0x48b992, pod_program 0x529080, Pl0000 vtable 0xc61628, start_animation 0x433c70, camera 0x1020bb0,
+    /// EmBase vtable 0xc79d78, em_start_animation 0x637970 (added 2026-11-22, same exe).
     /// The first nine match what nier_coop resolved at runtime on the same exe (its log, module base
     /// 0x7ff661fc0000).
     const EXPECTED_BUILD: u32 = 0x6ac8_9519;
@@ -224,7 +236,14 @@ pub(crate) mod tests {
             println!("note: exe build {:#x} differs from the verified build {EXPECTED_BUILD:#x}", a.build);
         }
         // Function entries must be real function starts.
-        for (n, f) in [("update", a.update), ("spawn", a.spawn), ("routine", a.routine), ("pod_program", a.pod_program), ("start_animation", a.start_animation)] {
+        for (n, f) in [
+            ("update", a.update),
+            ("spawn", a.spawn),
+            ("routine", a.routine),
+            ("pod_program", a.pod_program),
+            ("start_animation", a.start_animation),
+            ("em_start_animation", a.em_start_animation),
+        ] {
             assert_eq!(img.function_at(f).unwrap().begin, f, "{n} is not a function start");
         }
         // Mid-function sites are what the hooks expect.
@@ -235,6 +254,69 @@ pub(crate) mod tests {
         let classes = rtti::class_hierarchy(&img, a.pl0000_vtable).unwrap();
         println!("Pl0000 bases: {classes:?}");
         assert!(classes.iter().any(|c| c == ".?AVBehaviorAppBase@@"));
+        let em = rtti::class_hierarchy(&img, a.em_base_vtable).unwrap();
+        assert_eq!(em.first().map(String::as_str), Some(".?AVEmBase@@"));
+        assert!(em.iter().any(|c| c == ".?AVBehaviorAppBase@@"));
+        // Same signature as Pl0000's: it reads the current state at +0x670 (BehaviorAppBase) early on.
+        assert_ne!(a.em_start_animation, a.start_animation);
+    }
+
+    /// Every enemy class's `start_animation` slot reaches `em_start_animation`: directly, through a `jmp`
+    /// thunk, or through a wrapper that calls it. If a new enemy class overrides it, its animations would not
+    /// be synced, so this lists them.
+    /// `NIER_EXE=<exe> cargo test enemy_classes_share_start_animation -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn enemy_classes_share_start_animation() {
+        let bytes = exe_image();
+        let img = Image::new(&bytes, None).unwrap();
+        let a = resolve(&img, 0).unwrap();
+        let target = a.em_start_animation;
+        let call_or_jmp = |at: usize| {
+            img.walk(at, 16, |ip, ins| {
+                matches!(ins.mnemonic(), iced_x86::Mnemonic::Call | iced_x86::Mnemonic::Jmp) && img.insn_target(ip).ok() == Some(target)
+            })
+            .is_some()
+        };
+        let mut n = 0;
+        for (vt, chain) in rtti::all_vtables(&img) {
+            if !chain.iter().any(|c| c == ".?AVEmBase@@") {
+                continue;
+            }
+            n += 1;
+            let f = rtti::vtable_slot(&img, vt, sdk::START_ANIMATION_INDEX).unwrap();
+            assert!(f == target || call_or_jmp(f), "{} overrides start_animation ({f:#x})", chain[0]);
+        }
+        println!("{n} EmBase classes share em_start_animation");
+        assert!(n >= 30, "only {n} EmBase classes found");
+    }
+
+    /// The `EmBase` script natives enemy sync calls (looked up at runtime by CRC in the script table) still do
+    /// what `sync::world::set_no_die` / `die_routine` assume. Each native is registered by a static initializer
+    /// that loads it with `lea rax,[native]` right before `lea rcx,[name]`. Verified on build 7788.
+    /// `NIER_EXE=<exe> cargo test enemy_natives -- --ignored`
+    #[test]
+    #[ignore]
+    fn enemy_natives() {
+        let bytes = exe_image();
+        let img = Image::new(&bytes, None).unwrap();
+        let native = |name: &str| {
+            let r = img.string_refs(name).unwrap()[0];
+            let init = img.function_at(r).unwrap().begin;
+            img.insn_target(img.find_insn(init, 4, &pat("48 8D 05")).unwrap()).unwrap()
+        };
+        let code = |at: usize, n: usize| &img.bytes[at..at + n];
+        // mov dword ptr [rcx+2C330h],1 / 0; ret
+        assert_eq!(code(native("EmBase.onNoDieSuperArmor"), 11), [0xC7, 0x81, 0x30, 0xC3, 0x02, 0, 1, 0, 0, 0, 0xC3]);
+        assert_eq!(code(native("EmBase.offNoDieSuperArmor"), 11), [0xC7, 0x81, 0x30, 0xC3, 0x02, 0, 0, 0, 0, 0, 0xC3]);
+        // mov rax,[rcx]; jmp qword ptr [rax+550h]  (vtable slot 170)
+        assert_eq!(code(native("EmBase.setDieRtn"), 9), [0x48, 0x8B, 0x01, 0xFF, 0xA0, 0x50, 0x05, 0, 0]);
+        // EmBase's slot 170 starts a die state: `mov edx,0ACh` (or 0A9h) before calling start_animation.
+        let a = resolve(&img, 0).unwrap();
+        let die = rtti::vtable_slot(&img, a.em_base_vtable, 170).unwrap();
+        let die_end = img.function_at(die).unwrap().end;
+        let starts = |id: u32| Pattern::exact(&[&[0xBA][..], &id.to_le_bytes()].concat()).find_all(&img.bytes[die..die_end]).count();
+        assert!(sdk::EM_DIE_STATES.iter().all(|&s| starts(s) > 0), "die routine no longer starts {:x?}", sdk::EM_DIE_STATES);
     }
 
     /// Prints which DLLs the exe imports (is dinput8 a static import?) and other build facts.

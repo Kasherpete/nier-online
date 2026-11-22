@@ -1,16 +1,37 @@
 name: build
 
+# Every push and pull request: run the tests and build the DLL (downloadable from the run's page as the
+# `nier-online` artifact for 90 days).
+# Every push to main: also replace the `latest` pre-release with this build.
+# Every `v*` tag: also publish a permanent release under that tag.
+
 on:
   push:
     branches: ["**"]
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: write # create releases and move the `latest` tag
+
+# A newer push to the same branch cancels the older run, so two runs never race on the `latest` release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "$env:GITHUB_REF_NAME") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version. Set version = `"$($env:GITHUB_REF_NAME.TrimStart('v'))`" and tag again."
+          }
       # rust-toolchain.toml pins the stable toolchain; rustup installs it on first use.
       - name: Test
         run: cargo test --release
@@ -19,14 +40,36 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/nier_online.dll dist/dinput8.dll
+          New-Item -ItemType Directory -Force dist/nier-online | Out-Null
+          Copy-Item target/release/nier_online.dll dist/nier-online/dinput8.dll
+          Copy-Item tools/install.ps1 dist/nier-online/install.ps1
+          Compress-Archive -Path dist/nier-online/* -DestinationPath dist/nier-online.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: dinput8
-          path: dist/dinput8.dll
+          name: nier-online
+          path: dist/nier-online/
+
+      - name: Publish the latest build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $short = "$env:GITHUB_SHA".Substring(0, 7)
+          $notes = "Automatic build of $short (newest push to main). Unzip nier-online.zip and run install.ps1, " +
+                   "or copy dinput8.dll next to NieRAutomata.exe. Both players need the same build."
+          # Replace the previous `latest` release and its tag; ignore the error when there is none yet.
+          try { gh release delete latest --yes --cleanup-tag 2>$null } catch {}
+          $global:LASTEXITCODE = 0
+          gh release create latest dist/nier-online.zip dist/nier-online/dinput8.dll dist/nier-online/install.ps1 `
+            --target $env:GITHUB_SHA --prerelease --title "Latest build ($short)" --notes $notes
+
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/dinput8.dll
+          generate_release_notes: true # lists the commits and pull requests since the previous tag
+          files: |
+            dist/nier-online.zip
+            dist/nier-online/dinput8.dll
+            dist/nier-online/install.ps1

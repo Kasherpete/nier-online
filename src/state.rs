@@ -231,6 +231,8 @@ pub struct OverlayInfo {
     pub entities: Vec<EntityInfo>,
     /// Field dump of the entity selected in the debug panel.
     pub inspect: Option<Inspect>,
+    /// Enemy sync counters while a session syncs enemies.
+    pub enemy: Option<EnemyStats>,
     pub game_ok: bool,
 }
 
@@ -241,7 +243,33 @@ pub struct EntityInfo {
     pub class: String,
     pub pos: [f32; 3],
     pub hp: u32,
-    pub net_id: Option<u32>,
+    /// Net id and how it is synced: "host" (ours, sent), "paired" (our own entity follows the host's),
+    /// "copy" (spawned for the host's).
+    pub net: Option<(u32, &'static str)>,
+}
+
+/// Enemy sync counters for the overlay.
+#[derive(Clone, Debug, Default)]
+pub struct EnemyStats {
+    pub host: bool,
+    /// Live networked entities (host: sent; client: host entities known).
+    pub tracked: usize,
+    /// Client: host entities backed by one of our own entities / by a copy we spawned / by nothing yet.
+    pub paired: usize,
+    pub copies: usize,
+    pub waiting: usize,
+    /// Client: our own entities removed because the host had no match.
+    pub removed: u32,
+    /// Client: host animations replayed / refused (not yet seen for that enemy class here).
+    pub replayed: u32,
+    pub refused: u32,
+    /// Client: enemies killed because the host's died.
+    pub kills: u32,
+    /// Client: no host snapshot for a while (host loading?); our own AI runs our enemies meanwhile.
+    pub host_stale: bool,
+    /// Client: backed enemies the host's recent snapshots did not include (they run on our own AI).
+    pub no_updates: usize,
+    pub replay_unverified: bool,
 }
 
 #[derive(Clone, Debug, Default)]

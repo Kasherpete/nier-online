@@ -82,6 +82,8 @@ pub struct ClassInfo {
     pub chain: Vec<String>,
     pub is_app_base: bool,
     pub is_pl0000: bool,
+    /// Enemies: the `EmBase` natives (no-die, die routine) and the `EmBase::start_animation` detour apply.
+    pub is_em_base: bool,
     /// Enemies and animals: the host owns them (AutomataMP `Behavior::is_networkable`).
     pub is_networkable: bool,
 }
@@ -108,6 +110,7 @@ pub fn class_of_vtable(vtable: usize) -> Option<Arc<ClassInfo>> {
     let info = Arc::new(ClassInfo {
         is_app_base: has(".?AVBehaviorAppBase@@"),
         is_pl0000: vtable == g.addr.abs(g.addr.pl0000_vtable),
+        is_em_base: has(".?AVEmBase@@"),
         is_networkable: has(".?AVEmBase@@") || has(".?AVBaAnimal@@"),
         chain,
     });
@@ -198,6 +201,19 @@ pub fn set_suspend(this: *mut core::ffi::c_void, on: bool) -> bool {
 /// Removes an entity from the world (`Behavior.terminate`).
 pub fn terminate(b: *mut BehaviorAppBase) -> bool {
     call_this("Behavior.terminate", b.cast())
+}
+
+/// `EmBase.onNoDieSuperArmor` / `offNoDieSuperArmor` (set / clear `EmBase+0x2C330`, build 7788). While on, the
+/// enemy damage code (0x66d2f0) clamps HP at 1 and the hit reaction check (0x5842b0) skips the stagger.
+/// `b` must be a validated `EmBase`.
+pub fn set_no_die(b: *mut BehaviorAppBase, on: bool) -> bool {
+    call_this(if on { "EmBase.onNoDieSuperArmor" } else { "EmBase.offNoDieSuperArmor" }, b.cast())
+}
+
+/// `EmBase.setDieRtn`: the scripts' own "kill this enemy" (vtable slot 170, which starts the die state).
+/// `b` must be a validated `EmBase`.
+pub fn die_routine(b: *mut BehaviorAppBase) -> bool {
+    call_this("EmBase.setDieRtn", b.cast())
 }
 
 /// `fn(name, *mut Entity)`: gives an entity an AI routine.

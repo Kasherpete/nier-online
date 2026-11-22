@@ -1,4 +1,5 @@
-//! Logging: `nier_online.log` next to the game exe (truncated each run), a console window in debug builds,
+//! Logging: `nier_online.log` next to the game exe (truncated each run; a second copy of the game running at
+//! the same time writes `nier_online.2.log`), a console window in debug builds,
 //! and the last few hundred lines kept in memory for the overlay's log panel.
 
 use std::collections::VecDeque;
@@ -48,11 +49,42 @@ fn level(name: &str) -> Level {
     name.trim().parse().unwrap_or(Level::INFO)
 }
 
-pub fn init(level_name: &str) {
+/// Log file name for this game process: `nier_online.log` for the first copy of the game, `nier_online.2.log`
+/// for a second one running at the same time (the two-instance test), so they don't write over each other.
+/// Each copy holds a named mutex for its slot until it exits.
+fn file_name() -> String {
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::HSTRING;
+    for n in 1..=4 {
+        let name = HSTRING::from(format!("Local\\nier_online_log_{n}"));
+        // SAFETY: plain Win32 calls; the handle is deliberately kept open for the life of the process.
+        let taken = unsafe {
+            match CreateMutexW(None, false, &name) {
+                Ok(h) => {
+                    let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+                    if exists {
+                        let _ = windows::Win32::Foundation::CloseHandle(h);
+                    }
+                    exists
+                }
+                Err(_) => true,
+            }
+        };
+        if !taken {
+            return if n == 1 { "nier_online.log".into() } else { format!("nier_online.{n}.log") };
+        }
+    }
+    format!("nier_online.{}.log", std::process::id())
+}
+
+/// Returns the log file name.
+pub fn init(level_name: &str) -> String {
     // Our own crate at the configured level; libraries (iroh, quinn) only at warn, since they are chatty.
     let filter = Targets::new().with_target("nier_online", level(level_name)).with_default(Level::WARN);
 
-    let file = std::fs::File::create(crate::config::game_dir().join("nier_online.log")).ok().map(|f| {
+    let name = file_name();
+    let file = std::fs::File::create(crate::config::game_dir().join(&name)).ok().map(|f| {
         let (w, guard) = tracing_appender::non_blocking(f);
         std::mem::forget(guard); // flushes on drop; we live until the process exits
         tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w)
@@ -66,4 +98,5 @@ pub fn init(level_name: &str) {
         tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::io::stdout)
     });
     let _ = tracing_subscriber::registry().with(filter).with(file).with(ring).with(console).try_init();
+    name
 }

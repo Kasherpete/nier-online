@@ -53,7 +53,7 @@ Authority model:
 |---|---|---|
 | Each player's own character | That player | Snapshots, smoothed between updates |
 | Enemies, NPCs, world objects | Host | Host-issued spawns plus snapshots; the client's local spawns are deleted |
-| Damage to enemies | Host | The client sends a hit *request*; the host applies it and broadcasts the result |
+| Damage to enemies | Host | The client's puppet on the host replays the client's attacks, so they damage the host's enemies through the engine's own damage path; snapshots carry the HP back |
 | Quests, cutscenes, area, save | Host | Reliable events; the client follows |
 
 Do not attempt lockstep (both games simulating identically from the same inputs). The engine is not
@@ -145,21 +145,24 @@ Use the latest stable version of each crate at the time it is added, and pin it 
 
 ## Phase 0: Scaffold
 
-> Status (2026-11-21): everything below through Phase 6 is implemented and unit-tested, and every address
-> resolves against the build 7788 exe (`notes/2026-11-21-build-7788-addresses.md`). Nothing has run
-> in-game yet, so only items that do not need the game are ticked. Next step: install, check
-> `nier_online.log` for "all 16 addresses resolved" and the hook lines, then run the mirror test.
+> Status (2026-11-22): verified in-game: the mod loads, join codes connect, the overlay works, and player
+> sync and the name tag work. Phase 6 was reworked on 2026-11-22 (pairing, AI blocking, animation replay,
+> host-driven deaths; see `notes/2026-11-22-enemy-sync-reversing.md`). In-game, enemies now appear on the
+> client and stay in sync. Enemy sync and animation replay are on by default. Every address resolves against
+> the build 7788 exe; the log should say "all 18 addresses resolved". Next step: the rest of the Phase 6
+> checks (deaths, damage, enemy attacks on the client, bosses, disconnect).
 
 - [x] Cargo `cdylib` crate `nier_online`, edition 2024, stable pinned, target `x86_64-pc-windows-msvc`.
-- [ ] `dinput8.dll` proxy: export `DirectInput8Create` and forward it to the real
+- [x] `dinput8.dll` proxy: export `DirectInput8Create` and forward it to the real
       `%SystemRoot%\System32\dinput8.dll`. This is how the mod loads, with no injector needed.
-- [ ] `DllMain` spawns one worker thread and returns. The worker sets up logging (a console in debug builds,
+- [x] `DllMain` spawns one worker thread and returns. The worker sets up logging (a console in debug builds,
       plus a log file next to the exe) and then runs the later phases' setup.
 - [x] `LICENSE` (GPL-3.0) and `LICENSE-THIRD-PARTY` (the AutomataMP MIT notice).
 
 ## Phase 1: Address resolution
 
-Verified against the exe file on disk (the ignored tests), not yet observed at runtime.
+Verified against the exe file on disk (the ignored tests) and at runtime (2026-11-21 log: all addresses resolved,
+every hook installed, player sync working).
 
 - [x] Port `scan.rs` from nier_coop: pattern scan with wildcards, and RIP-relative resolution.
 - [x] Add AutomataMP's more robust lookup techniques (see its `shared/utility` and `shared/sdk/EntityList.cpp`):
@@ -177,12 +180,12 @@ Verified against the exe file on disk (the ignored tests), not yet observed at r
 
 ## Phase 2: Game-thread hook and shared state
 
-- [ ] Hook the per-frame update (nier_coop: a naked entry thunk that preserves the argument registers,
+- [x] Hook the per-frame update (nier_coop: a naked entry thunk that preserves the argument registers,
       because the signature is unknown). This is the game-thread tick where all sync logic runs.
 - [x] Port nier_coop's `state.rs`: single-writer seqlock slots for "latest value" data such as snapshots.
 - [x] Add bounded lock-free queues (for example `crossbeam-queue::ArrayQueue`) for discrete events in both
       directions. The game thread drains incoming commands once per frame.
-- [ ] Port the `sdk/` structs used so far, following rule 1. Take field offsets from AutomataMP's
+- [x] Port the `sdk/` structs used so far, following rule 1. Take field offsets from AutomataMP's
       `shared/sdk/*.hpp` and `reversing/nierautomata.genny`, and from nier_coop's `sdk/mod.rs`.
 
 ## Phase 3: ImGui overlay
@@ -190,8 +193,8 @@ Verified against the exe file on disk (the ignored tests), not yet observed at r
 AutomataMP draws an ImGui menu by hooking the DX11 swap chain (`src/hooks/D3D11Hook.cpp`) and the window
 procedure for input (`WindowsMessageHook.cpp`). In Rust, `hudhook` does both.
 
-- [ ] Overlay toggled with `Insert`. While it is open, block game input so typing doesn't move 2B.
-- [ ] Connection panel: **Host** (shows the join code with a Copy button), **Join** (paste a code), and
+- [x] Overlay toggled with `Insert`. While it is open, block game input so typing doesn't move 2B.
+- [x] Connection panel: **Host** (shows the join code with a Copy button), **Join** (paste a code), and
       **Disconnect**. Show status, ping and the peer's mod version.
 - [ ] Settings saved to `nier_online.toml` next to the exe: overlay key, player name, and debug flags.
 - [ ] Debug panel, based on AutomataMP's `Explorer.cpp`: list live entities with class, handle, position
@@ -209,15 +212,15 @@ Goal: no port forwarding, no Tailscale, no dedicated server. `iroh` gives each p
 ID. It connects directly through UDP hole punching when it can, and through a relay server when it can't
 (for example when both players are behind strict carrier-grade NAT). The connection is encrypted QUIC.
 
-- [ ] The net thread runs a single-threaded tokio runtime and owns the iroh `Endpoint`.
-- [ ] Host: create the endpoint, accept one incoming connection, and show a **join code** (the iroh endpoint
+- [x] The net thread runs a single-threaded tokio runtime and owns the iroh `Endpoint`.
+- [x] Host: create the endpoint, accept one incoming connection, and show a **join code** (the iroh endpoint
       address/ticket, base32-encoded so it can be pasted).
-- [ ] Client: parse the code and connect.
+- [x] Client: parse the code and connect.
 - [ ] Relays: start with iroh's default public relays. Check n0's current terms; if they don't suit a public
       release, self-host `iroh-relay` on a small VPS and put its URL in the config.
 - [ ] Optional LAN shortcut: a direct `IP:port` join that skips the relay and discovery.
-- [ ] Handshake on connect: a `Hello { protocol_version, mod_version, game_build }` exchange. Refuse
-      mismatches with a clear message in the overlay.
+- [x] Handshake on connect: a `Hello { protocol_version, mod_version, game_build }` exchange. Refuse
+      mismatches with a clear message in the overlay. (Matching versions verified; the refusal path is not.)
 - [ ] Channels on the one QUIC connection:
       - **Unreliable datagrams** for snapshots (players, enemies), 30–60 Hz, latest-wins, each with a
         sequence number so old ones are dropped.
@@ -234,16 +237,17 @@ ID. It connects directly through UDP hole punching when it can, and through a re
 
 Implemented in `src/sync/player.rs` on the delayed timeline in `src/sync/interp.rs`, which replaces nier_coop's
 "move halfway to the newest packet" and its one-animation-per-packet limit. Not yet done: weapons and
-loadout (writing `weapon_index` alone could crash), and the name tag's camera math is unverified.
+loadout (writing `weapon_index` alone could crash). The puppet's weapon also sets how hard the client hits
+enemies, since the puppet deals the client's damage on the host (Phase 6).
 
 Port this from nier_coop (`hooks/spawn.rs`, `hooks/mod.rs`). Its method came from AutomataMP's
 `Player.cpp` and `PlayerHook.cpp`.
 
-- [ ] Spawn a second 2B (`Pl0000`) and make her the local player's buddy, using the AutomataMP sequence
+- [x] Spawn a second 2B (`Pl0000`) and make her the local player's buddy, using the AutomataMP sequence
       (spawn, set as buddy, `changePlayer` twice).
-- [ ] Suppress her buddy AI while connected. Drive her through her controller fields (stick, held and
+- [x] Suppress her buddy AI while connected. Drive her through her controller fields (stick, held and
       pressed buttons) plus replayed `start_animation` calls, never through the local gamepad.
-- [ ] **Position correction:** inputs alone drift. Each snapshot carries position and rotation. Show her
+- [x] **Position correction:** inputs alone drift. Each snapshot carries position and rotation. Show her
       ~100 ms behind real time, smoothing between the two snapshots around that time; blend toward the
       true position when the error is small, and snap when it is large (for example over 3 m).
 - [ ] Pod: fire through `ai_pod_fire`, aim at the peer's aim point (nier_coop's mid-function hook in
@@ -252,37 +256,61 @@ Port this from nier_coop (`hooks/spawn.rs`, `hooks/mod.rs`). Its method came fro
 - [ ] Weapons and loadout, and the pod flashlight (both in AutomataMP's player sync list).
 - [ ] Keep her invincible (`muteki_timer`) and show the peer's HP, because her death would fail the mission.
       Respawn her after the game removes her (area load, restart).
-- [ ] Name tag above her head (ImGui, projected with the game camera; see AutomataMP `CameraGame.cpp`).
+- [x] Name tag above her head (ImGui, projected with the game camera; see AutomataMP `CameraGame.cpp`).
 - [ ] Verify with the mirror test, then between two PCs.
 
-## Phase 6: Enemy sync (host spawns, client mirrors)
+## Phase 6: Enemy sync (host owns enemies, client mirrors them)
 
-First pass in `src/sync/entities.rs`, behind the `enemy_sync` setting (off by default). Gaps: client copies
-still run their own AI, enemy animations are not replayed, `PlayerHit` is not implemented (client copies
-hit the client locally instead), and damage is inferred from local HP loss rather than a damage hook.
+Implemented in `src/sync/entities.rs` (second pass, 2026-11-22), behind the `enemy_sync` setting (on by default,
+the host's setting decides). Reversing behind it: `notes/2026-11-22-enemy-sync-reversing.md`.
 
-This is AutomataMP's design (`src/mods/multiplayer/EntitySync.cpp`, the Go server's `SpawnEntity` and
-`EntityData` handlers). It replaces nier_coop's approach of matching the client's own enemies to the
-host's, which fails whenever the two games spawned different enemies.
+In-game findings (2026-11-22, two instances):
+- The spawn hook did not report the enemies seen, so the host also scans the entity list every 250 ms.
+- Many enemies have an empty entity name, so the host sends `em` plus the model's low 16 bits.
+- The host sends only yaw (rotation .y) and a heartbeat batch every 50 ms even when it has no enemies.
+  Before that change the client kept losing enemy updates after a few seconds, and its enemies went back to
+  their own AI.
+
+The design combines AutomataMP's (`src/mods/multiplayer/EntitySync.cpp`, the Go server's `SpawnEntity` and
+`EntityData` handlers: the host announces spawns and streams state, the client spawns copies) with the newer
+local nier_coop's (`../nier_coop/src/hooks/world.rs` and `enemy_anim.rs`: pair the client's own enemies with
+the host's, and block the client's enemy AI from starting animations). Pairing alone fails when the two games
+spawn different enemies, and delete-and-respawn alone breaks the client's scripts, which wait on their own
+enemies (quest triggers, boss phases, boss parts). So the client does both: it pairs where it can and
+spawns or deletes where it can't.
 
 - [ ] Hook the entity spawn function on both sides and read its `EntitySpawnParams` (model / object ID,
-      name, position, rotation, set type; see AutomataMP `EntitySpawnParams` and `EntitySpawn.go`).
-- [ ] **Host:** when an enemy or NPC spawns, give it a network ID and send `SpawnEntity { net_id, params }`.
-- [ ] **Client:** let its own game spawn nothing that the network should own. When the game spawns a
-      networked type on its own, delete it (AutomataMP: "deletes enemies on normal clients that are not
-      supposed to be networked"). When `SpawnEntity` arrives, set a "host-requested" flag, call the spawn
-      function with the host's params, clear the flag, and map `net_id` to the new handle.
-- [ ] Turn off AI on the client's copies. Drive them with `EntityData` snapshots (position, rotation, HP,
-      alive) at 20–30 Hz with the same smoothing as the remote player, plus `EntityAnimationStart` events.
-- [ ] **Damage:** when the client hits a host-owned enemy, swallow the local damage and send
-      `HitRequest { net_id, damage, attack type }`. The host applies it through the normal damage path and
-      its next snapshot carries the new HP. Death and destruction are sent as reliable `DestroyEntity`
-      events.
-- [ ] Enemy attacks on the client's player: the client's copies don't attack on their own, so the host's
-      hits on the remote 2B must be forwarded to the client (`PlayerHit { damage, knockback }`).
+      name, position, rotation; see AutomataMP `EntitySpawnParams` and `EntitySpawn.go`). Hooked, but it
+      missed the enemies seen in-game; the 250 ms list scan covers them. Find the spawn path enemy sets use.
+- [x] **Host:** when an enemy or animal spawns, give it a network ID and send `SpawnEntity { net_id, params }`.
+      Snapshots (position, yaw, HP) at 20 Hz in `Datagram::Entities`.
+- [x] **Client, pairing:** back each host entity with one of the client's own entities of the same model within
+      30 m, or the only one of that model on both sides at any distance (bosses). When nothing matches
+      within 2 s, spawn a copy (the "host-requested" flag lets the spawn hook pass it), and swap the copy for
+      the client's own entity if one turns up later. The client's own networkable entities that match nothing
+      for 3 s are deleted (AutomataMP: "deletes enemies on normal clients that are not supposed to be
+      networked").
+- [x] **AI off on the client:** one detour on `EmBase::start_animation` (0x637970 on build 7788, shared by all 34
+      enemy classes). The host sends every enemy's calls as `EntityAnim`; the client drops its own AI's calls
+      on backing enemies and replays the host's. With `enemy_replay_unverified` (on by default since
+      2026-11-22, no crash seen) every host call is replayed. Off, only (class, animation) pairs the client's
+      own game has started are replayed (the allowlist learns from the blocked calls too).
+- [ ] **Deaths:** backing enemies get `EmBase.onNoDieSuperArmor` (HP clamps at 1, no local stagger). The host
+      sends `EntityDied` when the die state (0xAC / 0xA9) starts, or when HP has stayed at 0 for 1 s; the client
+      clears no-die and calls `EmBase.setDieRtn`, the scripts' own kill, so its quest scripts see a real death.
+      `DestroyEntity` follows when the host's entity leaves the list.
+- [ ] **Damage:** no hit requests. The client's puppet on the host replays the client's attacks, so they hit the
+      host's enemies through the engine's own damage path. The first pass also sent HP-loss-based
+      `HitRequest`s, which counted every hit twice (and counted the host puppet's hits on the client too).
+      The client shows its own hits at once and holds them up to 1.5 s until the host's HP reflects them.
+- [ ] **Enemy attacks on the client's player:** expected to come from the replayed attack animations playing on
+      the client's backing enemies (aimed at where the client stands, since the host's enemy was attacking the
+      puppet there). If attack hitboxes turn out not to follow the animation, add `PlayerHit { damage,
+      knockback }` from the host's hits on the puppet.
 - [ ] **Late join / reconnect:** on connect, the host sends `SpawnEntity` for every live networked entity.
-- [ ] Decide per class which entities are networked (enemies, bosses, destructibles, NPCs) and which stay
-      local (effects, projectiles, cosmetic props). Keep the list in one table in `sync/entities.rs`.
+- [ ] Networked classes: `EmBase` (enemies and bosses) and `BaAnimal`; everything else stays local (boss parts,
+      NPCs, hacking enemies, effects, bullets). The check is `ClassInfo::is_networkable` in `sync/world.rs`.
+- [ ] Session end, or no host snapshot for 1 s (host loading): the client's AI runs its enemies again.
 
 ## Phase 7: Areas and world state
 
@@ -299,6 +327,13 @@ The public nier_coop repo doesn't include this. A newer nier_coop build (v0.0.8)
 quest sync; its log shows it hooks `request_state`, the event signal post, the quest system's set/reset
 functions, and the game's first save read. Port from that source if it is available; otherwise reverse it
 again, using those hook points as a map.
+
+That newer source is checked out next to this repo, at `../nier_coop` (GPL-3.0, port directly). The parts that
+matter here are `src/hooks/events.rs` (cutscene play, SendCommand, objective state and enemy-set spawns,
+retried until the client has loaded the action), `src/hooks/quest.rs` (scene-state sets and resets),
+`src/hooks/savefile.rs` with `src/net/save.rs` (holding the first save read, save transfer), and
+`notes/quest-state.md` and `notes/death-and-warp.md`. Its offsets are for the 2026-10-09 exe; nine of them
+matched build 7788, but re-resolve every one.
 
 - [ ] **Save sync at startup:** the client holds the game's first save read until the host's save arrives,
       writes it to a separate slot, and loads it, so both games start from identical progress. Never
@@ -320,7 +355,11 @@ reverse it live.
       class, then add a flight-unit variant to the player snapshot and spawn path.
 - [ ] **2D / side-scrolling camera sections:** check that position correction respects the locked axis.
 - [ ] **9S hacking minigames:** start with "the other player waits" and show a status line; sync later, if ever.
-- [ ] **Boss fights with scripted phases:** confirm phase changes come only from the host.
+- [ ] **Boss fights with scripted phases:** confirm phase changes come only from the host. With Phase 6
+      pairing, the client's own boss backs the host's (the only one of its model, so it pairs at any
+      distance). The boss keeps its parts and the client's phase scripts, its phase animations are replayed
+      from the host, and its HP follows the host's. Check this per boss; bosses whose parts carry their own
+      HP may need the parts synced too.
 - [ ] **Playing as 9S or A2:** spawn the remote player as the right model for the route.
 
 ## Phase 10: Polish and release
@@ -329,7 +368,9 @@ reverse it live.
 - [ ] Connection quality display: ping, packet loss, relay vs. direct.
 - [ ] Crash handler that writes a minidump and the last log lines (AutomataMP `ExceptionHandler.cpp`).
 - [ ] Compatibility check with common mods such as FAR (Fix Automata Resolution), which also hook DX11.
-- [ ] GitHub Actions: build on every push, attach `dinput8.dll` to tagged releases.
+- [ ] GitHub Actions: build on every push, attach `dinput8.dll` to tagged releases. Written: every push to
+      `main` replaces the `latest` pre-release (`nier-online.zip` with `dinput8.dll` and `install.ps1`), and
+      `v*` tags publish permanent releases. Not yet run on GitHub.
 - [ ] README install guide with screenshots.
 - [ ] After each game update, run the ignored address tests first, and fix patterns before anything else.
 
@@ -344,7 +385,7 @@ reverse it live.
 | Thread handoff | `src/state.rs` seqlock | — |
 | Remote player spawn | `src/hooks/spawn.rs` | `src/mods/multiplayer/Player.cpp`, `PlayerHook.cpp` |
 | Pod sync | `src/hooks/mod.rs` | `MidHooks.cpp` |
-| Enemy sync | — | `EntitySync.cpp`, server `handlers/SpawnEntity.go`, `EntityData.go` |
+| Enemy sync | `../nier_coop`: `src/hooks/world.rs` (pairing), `enemy_anim.rs` (AI blocking) | `EntitySync.cpp`, server `handlers/SpawnEntity.go`, `EntityData.go` |
 | Overlay UI | — | `D3D11Hook.cpp`, `WindowsMessageHook.cpp`, `Explorer.cpp` |
 | Packet design | `src/net/mod.rs` (validation) | `schema/*.fbs` (message types) |
 | Scripting VM | — | `ScriptFunctions.cpp` (mruby function table) |

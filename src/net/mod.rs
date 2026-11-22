@@ -22,7 +22,11 @@ use crate::config;
 use crate::state::{self, GameCommand, NetCommand, Q, Received, Role};
 use protocol::{ALPN, Datagram, Event, Hello, MAX_FRAME, PROTOCOL_VERSION};
 
-pub const MOD_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Crate version plus the git commit it was built from ("-dirty" with uncommitted changes, see `build.rs`).
+/// Both players must match exactly.
+pub const MOD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("NIER_ONLINE_COMMIT"));
+/// When this DLL was built (shown in the menu and log, not compared).
+pub const BUILT: &str = env!("NIER_ONLINE_BUILT");
 /// Snapshot send interval (one per game frame at 60 fps).
 const SEND_EVERY: Duration = Duration::from_millis(16);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -341,7 +345,7 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
     let datagrams_in = {
         let conn = conn.clone();
         tokio::spawn(async move {
-            let (mut last_player, mut last_batch) = (None::<u32>, 0u32);
+            let (mut last_player, mut last_batch, mut bad) = (None::<u32>, 0u32, 0u32);
             while let Ok(d) = conn.read_datagram().await {
                 let at_ms = state::now_ms();
                 match protocol::decode_datagram(&d) {
@@ -359,7 +363,15 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
                             let _ = Q.in_entities.force_push(Received { at_ms, value: items });
                         }
                     }
-                    Err(e) => tracing::debug!("dropped bad datagram: {e}"),
+                    Err(e) => {
+                        bad += 1;
+                        // The first few at warn (a whole snapshot stream can die this way), then quietly.
+                        if bad <= 10 {
+                            tracing::warn!("dropped bad datagram ({} bytes): {e}", d.len());
+                        } else {
+                            tracing::debug!("dropped bad datagram: {e}");
+                        }
+                    }
                 }
             }
         })
@@ -367,6 +379,7 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
 
     let mut tick = interval(SEND_EVERY);
     let mut seq = 0u32;
+    let mut send_errors = 0u32;
     let mut last_status = Instant::now();
     let result = loop {
         tokio::select! {
@@ -381,8 +394,13 @@ async fn session(conn: Connection, mut send: SendStream, mut recv: RecvStream, r
         }
         while let Some(d) = Q.out_datagrams.pop() {
             let b = protocol::encode(&d);
-            if b.len() <= protocol::MAX_DATAGRAM {
-                let _ = conn.send_datagram(Bytes::from(b));
+            let len = b.len();
+            let r = if len <= protocol::MAX_DATAGRAM { conn.send_datagram(Bytes::from(b)).map_err(|e| e.to_string()) } else { Err("too large".into()) };
+            if let Err(e) = r {
+                send_errors += 1;
+                if send_errors <= 10 {
+                    tracing::warn!("could not send a {len}-byte datagram: {e}");
+                }
             }
         }
         let mut failed = None;

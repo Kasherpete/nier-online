@@ -13,7 +13,8 @@ pub struct Config {
     pub overlay_key: String,
     /// Shown to the other player.
     pub player_name: String,
-    /// EXPERIMENTAL: the host owns enemies and the client mirrors them. The host's setting decides.
+    /// The host owns enemies and the client mirrors them. The host's setting decides. On by default since
+    /// 2026-11-22 (verified in-game: enemies spawn and stay in sync).
     pub enemy_sync: bool,
     /// Relay server URL. Empty = iroh's default public relays (n0).
     pub relay_url: String,
@@ -21,6 +22,11 @@ pub struct Config {
     pub log_level: String,
     /// Debug: draw the debug panel (entity explorer).
     pub debug_panel: bool,
+    /// Client: replay host enemy animations even for (enemy class, animation) pairs this game has not started
+    /// itself yet. On by default (2026-11-22: without it, enemies slide without attacking until the allowlist
+    /// fills, and no crash was seen with it on). Turn off if enemy fights crash: an id the engine has never
+    /// used for that class could.
+    pub enemy_replay_unverified: bool,
 }
 
 impl Default for Config {
@@ -28,10 +34,11 @@ impl Default for Config {
         Self {
             overlay_key: "Insert".into(),
             player_name: "Player".into(),
-            enemy_sync: false,
+            enemy_sync: true,
             relay_url: String::new(),
             log_level: "info".into(),
             debug_panel: false,
+            enemy_replay_unverified: true,
         }
     }
 }

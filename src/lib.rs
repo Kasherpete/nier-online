@@ -68,8 +68,8 @@ fn live_image() -> Result<(&'static [u8], usize), String> {
 
 fn worker(module: HINSTANCE) {
     let cfg = config::get();
-    log::init(&cfg.log_level);
-    tracing::info!("nier-online {} loaded", net::MOD_VERSION);
+    let log_file = log::init(&cfg.log_level);
+    tracing::info!("nier-online {} (built {}) loaded, logging to {log_file}", net::MOD_VERSION, net::BUILT);
 
     let (bytes, base) = match live_image() {
         Ok(v) => v,
@@ -87,7 +87,7 @@ fn worker(module: HINSTANCE) {
             return;
         }
     };
-    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, 16);
+    tracing::info!("game build {:08x}, all {} addresses resolved", addresses.build, 18);
     let build = addresses.build;
     if let Err(e) = hooks::install(addresses, img) {
         // Hooks are installed in an order where a failure leaves the game consistent (the tick goes last).

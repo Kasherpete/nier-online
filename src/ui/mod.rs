@@ -117,13 +117,13 @@ impl ImguiRenderLoop for Overlay {
             }
             return;
         }
-        ui.window(format!("nier-online {}", crate::net::MOD_VERSION))
+        ui.window(format!("nier-online {} (built {})###nier-online", crate::net::MOD_VERSION, crate::net::BUILT))
             .size([460.0, 420.0], Condition::FirstUseEver)
             .position([40.0, 40.0], Condition::FirstUseEver)
             .build(|| {
                 if let Some(_bar) = ui.tab_bar("tabs") {
                     if let Some(_t) = ui.tab_item("Connection") {
-                        self.connection_tab(ui, &net);
+                        self.connection_tab(ui, &net, &info);
                     }
                     if let Some(_t) = ui.tab_item("Chat") {
                         self.chat_tab(ui, &net);
@@ -164,7 +164,7 @@ impl Overlay {
         dl.add_text([p[0] - w / 2.0, p[1]], [1.0, 1.0, 1.0, 1.0], text);
     }
 
-    fn connection_tab(&mut self, ui: &Ui, net: &state::NetStatus) {
+    fn connection_tab(&mut self, ui: &Ui, net: &state::NetStatus, info: &state::OverlayInfo) {
         ui.text("Status:");
         ui.same_line();
         ui.text_colored(if net.connected { GREEN } else { GREY }, &net.state);
@@ -180,6 +180,9 @@ impl Overlay {
             match net.rtt_ms {
                 Some(r) => ui.text(format!("Ping: {r:.0} ms ({})", net.path.unwrap_or("?"))),
                 None => ui.text("Ping: measuring..."),
+            }
+            if let Some(es) = &info.enemy {
+                enemy_stats(ui, es);
             }
             if ui.button("Disconnect") {
                 let _ = Q.net_cmds.push(NetCommand::Disconnect);
@@ -250,7 +253,8 @@ impl Overlay {
     fn settings_tab(&mut self, ui: &Ui) {
         ui.input_text("Player name", &mut self.cfg.player_name).build();
         ui.input_text("Menu key", &mut self.cfg.overlay_key).build();
-        ui.checkbox("Enemy sync (experimental, host decides)", &mut self.cfg.enemy_sync);
+        ui.checkbox("Enemy sync (host decides)", &mut self.cfg.enemy_sync);
+        ui.checkbox("Replay all enemy animations (client; turn off if enemy fights crash)", &mut self.cfg.enemy_replay_unverified);
         ui.input_text("Relay URL", &mut self.cfg.relay_url).hint("empty = default public relays").build();
         ui.checkbox("Debug panel", &mut self.cfg.debug_panel);
         ui.input_text("Log level", &mut self.cfg.log_level).build();
@@ -292,7 +296,7 @@ impl Overlay {
                     e.pos[0],
                     e.pos[1],
                     e.pos[2],
-                    e.net_id.map(|n| format!(" net {n}")).unwrap_or_default(),
+                    e.net.map(|(n, k)| format!(" net {n} {k}")).unwrap_or_default(),
                     e.handle
                 );
                 if ui.selectable_config(&label).selected(selected == e.handle).build() {
@@ -308,6 +312,34 @@ impl Overlay {
                 }
             });
         }
+    }
+}
+
+fn enemy_stats(ui: &Ui, es: &state::EnemyStats) {
+    ui.separator();
+    if es.host {
+        ui.text(format!("Enemy sync (host): sending {} enemies", es.tracked));
+        return;
+    }
+    ui.text(format!(
+        "Enemy sync: {} host enemies ({} ours, {} spawned copies, {} waiting)",
+        es.tracked, es.paired, es.copies, es.waiting
+    ));
+    ui.text_colored(
+        GREY,
+        format!(
+            "removed {}, killed {}, animations {} replayed / {} refused{}",
+            es.removed,
+            es.kills,
+            es.replayed,
+            es.refused,
+            if es.replay_unverified { " (unverified on)" } else { "" }
+        ),
+    );
+    if es.host_stale {
+        ui.text_colored([1.0, 0.8, 0.3, 1.0], "No enemy updates from the host (loading?)");
+    } else if es.no_updates > 0 {
+        ui.text_colored([1.0, 0.8, 0.3, 1.0], format!("{} enemies get no updates from the host", es.no_updates));
     }
 }
 

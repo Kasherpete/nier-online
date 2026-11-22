@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::sdk::{self, cVec4};
 
 /// Bumped on any change to the message shapes below. Both sides must match exactly.
-pub const PROTOCOL_VERSION: u16 = 1;
-/// QUIC application protocol id.
+pub const PROTOCOL_VERSION: u16 = 2;
+/// QUIC application protocol id. Kept at /1 across protocol versions, so a peer on another version still
+/// connects and gets the clear refusal from the `Hello` check instead of a bare connection error.
 pub const ALPN: &[u8] = b"nier-online/1";
 /// Largest datagram we send or accept. QUIC datagrams must fit one packet (~1200 bytes minimum MTU).
 pub const MAX_DATAGRAM: usize = 1100;
@@ -26,9 +27,9 @@ pub const MAX_NAME: usize = 32;
 pub const MAX_CHAT: usize = 256;
 /// Entity names live in a 0x20-byte field with a NUL terminator.
 pub const MAX_ENTITY_NAME: usize = 31;
-const MAX_HP: u32 = 10_000_000;
+pub const MAX_HP: u32 = 10_000_000;
 /// Animation ids above this are not real animations; replaying garbage ids can crash the engine.
-const MAX_ANIM: u32 = 4096;
+pub const MAX_ANIM: u32 = 4096;
 
 /// One player's state, sampled once per game frame by its owner.
 #[repr(C)]
@@ -101,10 +102,12 @@ pub enum Event {
     Buttons { time_ms: u32, buttons: [u32; 8] },
     /// Host -> client: spawn a host-owned entity.
     SpawnEntity(SpawnEntity),
-    /// Host -> client: a host-owned entity died or was removed.
+    /// Host -> client: a host-owned entity started an animation (`EmBase::start_animation` arguments).
+    EntityAnim { net_id: u32, args: [u32; 4] },
+    /// Host -> client: a host-owned entity died (its die state started, or its HP reached 0).
+    EntityDied { net_id: u32 },
+    /// Host -> client: a host-owned entity was removed from the world.
     DestroyEntity { net_id: u32 },
-    /// Client -> host: the client hit a host-owned entity for this much damage.
-    HitRequest { net_id: u32, damage: u32 },
     Chat { text: String },
 }
 
@@ -184,12 +187,12 @@ pub fn decode_event(b: &[u8]) -> Result<Event, DecodeError> {
             check(args[0] < MAX_ANIM, "animation id out of range")?;
             check(!sdk::ANIM_CRASHES.contains(&args[0]), "animation id known to crash")?;
         }
-        Event::Buttons { .. } | Event::DestroyEntity { .. } => {}
+        Event::Buttons { .. } | Event::DestroyEntity { .. } | Event::EntityDied { .. } => {}
+        Event::EntityAnim { args, .. } => check(args[0] < MAX_ANIM, "entity animation id out of range")?,
         Event::SpawnEntity(s) => {
             check(!s.name.is_empty() && s.name.len() <= MAX_ENTITY_NAME && s.name.bytes().all(|b| b.is_ascii_graphic()), "bad entity name")?;
             check(s.pos.is_sane() && s.rot.is_sane(), "non-finite spawn transform")?;
         }
-        Event::HitRequest { damage, .. } => check(*damage <= MAX_HP, "damage out of range")?,
         Event::Chat { text } => check(short_text(text, MAX_CHAT), "bad chat text")?,
     }
     Ok(e)
@@ -233,7 +236,8 @@ mod tests {
             Event::Buttons { time_ms: 5, buttons: [1; 8] },
             Event::SpawnEntity(SpawnEntity { net_id: 1, name: "em1000".into(), model: 0x21020, pos: cVec4::default(), rot: cVec4::default() }),
             Event::DestroyEntity { net_id: 1 },
-            Event::HitRequest { net_id: 1, damage: 50 },
+            Event::EntityAnim { net_id: 1, args: [0xAC, 0, 0, 0] },
+            Event::EntityDied { net_id: 1 },
             Event::Chat { text: "hello".into() },
         ] {
             assert_eq!(decode_event(&encode(&e)), Ok(e));
@@ -263,6 +267,8 @@ mod tests {
         assert!(matches!(decode_event(&encode(&crash)), Err(DecodeError::Invalid(_))));
         let name = Event::SpawnEntity(SpawnEntity { net_id: 1, name: "a".repeat(32), model: 0, pos: cVec4::default(), rot: cVec4::default() });
         assert!(matches!(decode_event(&encode(&name)), Err(DecodeError::Invalid(_))));
+        let anim = Event::EntityAnim { net_id: 1, args: [MAX_ANIM, 0, 0, 0] };
+        assert!(matches!(decode_event(&encode(&anim)), Err(DecodeError::Invalid(_))));
         let ctl = Event::Chat { text: "a\nb".into() };
         assert!(matches!(decode_event(&encode(&ctl)), Err(DecodeError::Invalid(_))));
         let long_name = Event::Hello(Hello { protocol: 1, mod_version: "x".into(), game_build: 0, name: "n".repeat(33), enemy_sync: false });

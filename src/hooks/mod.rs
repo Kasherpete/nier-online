@@ -131,6 +131,7 @@ pub type StartAnimFn = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32
 
 pub static SPAWN: OnceLock<GenericDetour<SpawnFn>> = OnceLock::new();
 pub static START_ANIM: OnceLock<GenericDetour<StartAnimFn>> = OnceLock::new();
+pub static EM_START_ANIM: OnceLock<GenericDetour<StartAnimFn>> = OnceLock::new();
 
 unsafe extern "system" fn spawn_detour(spawner: *mut c_void, params: *const SpawnParams) -> *mut Entity {
     crate::sync::entities::on_spawn(spawner, params)
@@ -138,6 +139,10 @@ unsafe extern "system" fn spawn_detour(spawner: *mut c_void, params: *const Spaw
 
 unsafe extern "system" fn start_anim_detour(this: *mut c_void, anim: u32, variant: u32, a3: u32, a4: u32) {
     crate::sync::player::on_start_animation(this, anim, variant, a3, a4)
+}
+
+unsafe extern "system" fn em_start_anim_detour(this: *mut c_void, anim: u32, variant: u32, a3: u32, a4: u32) {
+    crate::sync::entities::on_em_start_animation(this, anim, variant, a3, a4)
 }
 
 /// Calls the game's spawn function, bypassing our detour.
@@ -153,6 +158,14 @@ pub fn call_spawn(spawner: *mut c_void, params: *const SpawnParams) -> *mut Enti
 pub fn call_start_animation(this: *mut c_void, anim: u32, variant: u32, a3: u32, a4: u32) {
     if let Some(d) = START_ANIM.get() {
         // SAFETY: as in `call_spawn`; `this` is a validated Pl0000.
+        unsafe { d.call(this, anim, variant, a3, a4) }
+    }
+}
+
+/// Calls the original `EmBase::start_animation`, bypassing our detour.
+pub fn call_em_start_animation(this: *mut c_void, anim: u32, variant: u32, a3: u32, a4: u32) {
+    if let Some(d) = EM_START_ANIM.get() {
+        // SAFETY: as in `call_spawn`; `this` is a validated EmBase.
         unsafe { d.call(this, anim, variant, a3, a4) }
     }
 }
@@ -205,6 +218,12 @@ pub fn install(addr: Addresses, img: Image<'static>) -> Result<(), String> {
             &START_ANIM,
             std::mem::transmute::<usize, StartAnimFn>(a.abs(a.start_animation)),
             start_anim_detour as StartAnimFn,
+        )?;
+        detour(
+            "em_start_animation",
+            &EM_START_ANIM,
+            std::mem::transmute::<usize, StartAnimFn>(a.abs(a.em_start_animation)),
+            em_start_anim_detour as StartAnimFn,
         )?;
     }
     mid_hook("held_store", a.abs(a.held_store), on_held_store)?;

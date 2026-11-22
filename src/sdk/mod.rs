@@ -157,6 +157,11 @@ pub const ANIM_CRASHES: [u32; 4] = [27, 65, 104, 106];
 pub const ANIM_FROM_INPUT: [u32; 2] = [16, 18];
 /// Animation the spawned partner's buddy AI starts every idle frame; dropped for the remote player.
 pub const ANIM_PARTNER_WAIT: u32 = 1_000_000;
+/// `EmBase` die states: its die routine (vtable slot 170, what `EmBase.setDieRtn` calls) starts 0xAC, or 0xA9
+/// for some models and flags (build 7788, 0x614720). `EmBase::start_animation` remaps 0xAC to 0xAF for a few
+/// models *after* our detour sees the call.
+pub const EM_DIE_STATES: [u32; 2] = [0xA9, 0xAC];
+
 /// Vtable slot of `Behavior::start_animation(this, anim, variant, a3, a4)` (AutomataMP `Behavior.hpp`).
 pub const START_ANIMATION_INDEX: usize = 18;
 
