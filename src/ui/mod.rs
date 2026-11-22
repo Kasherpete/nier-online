@@ -3,6 +3,7 @@
 //! in `crate::state` and sends commands through queues.
 
 mod clipboard;
+mod cursor;
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -21,6 +22,7 @@ const RED: [f32; 4] = [1.0, 0.45, 0.4, 1.0];
 const GREY: [f32; 4] = [0.7, 0.7, 0.7, 1.0];
 
 pub fn start(module: HINSTANCE) {
+    cursor::install();
     let overlay = Overlay::new();
     let hooks = hudhook::Hudhook::builder().with::<hudhook::hooks::dx11::ImguiDx11Hooks>(overlay).with_hmodule(module).build();
     match hooks.apply() {
@@ -67,6 +69,9 @@ impl Overlay {
         if down && !self.key_was_down {
             self.visible = !self.visible;
             state::OVERLAY_VISIBLE.store(self.visible, Relaxed);
+            if self.visible {
+                cursor::release();
+            }
             state::DEBUG_LIST_WANTED.store(self.visible && self.cfg.debug_panel, Relaxed);
         }
         self.key_was_down = down;
@@ -108,13 +113,12 @@ impl ImguiRenderLoop for Overlay {
         let info = state::OVERLAY.lock().map(|o| o.clone()).unwrap_or_default();
         self.draw_name_tag(ui, &net, &info);
         if !self.visible {
-            if net.connected {
-                let line = match net.rtt_ms {
-                    Some(r) => format!("nier-online: {} | {:.0} ms {}", net.state, r, net.path.unwrap_or("")),
-                    None => format!("nier-online: {}", net.state),
-                };
-                ui.get_background_draw_list().add_text([8.0, 8.0], [1.0, 1.0, 1.0, 0.8], line);
-            }
+            let line = match net.rtt_ms {
+                Some(r) if net.connected => format!("nier-online: {} | {:.0} ms {}", net.state, r, net.path.unwrap_or("")),
+                _ if net.connected => format!("nier-online: {}", net.state),
+                _ => format!("nier-online: {} ({} for menu)", net.state, self.cfg.overlay_key),
+            };
+            ui.get_background_draw_list().add_text([8.0, 8.0], [1.0, 1.0, 1.0, 0.8], line);
             return;
         }
         ui.window(format!("nier-online {} (built {})###nier-online", crate::net::MOD_VERSION, crate::net::BUILT))

@@ -101,6 +101,8 @@ Third-party notices are in [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).
 - [praydog/AutomataMP](https://github.com/praydog/AutomataMP) (MIT): original offsets and patterns, the
   host-owned enemy sync design, the ImGui overlay approach, and the reversed engine structures.
 
+**0.2.1:** Fixed mouse being reset to center while in nier-online ImGui menu, minor enhancements
+
 **v0.2.0:** Added enemy position and state synchronization, updated networking implementation, fixed various minor bugs.
 
 **v0.1.0:** Initial commit. Implemented player state synchronization and ImGui menu.

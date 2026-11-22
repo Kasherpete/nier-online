@@ -4,12 +4,16 @@
 //! It also blocks game input while the overlay is open: the game reads keyboard and mouse through
 //! DirectInput, not window messages, so on each device it creates we patch `GetDeviceState` and
 //! `GetDeviceData` to return "nothing pressed" while `state::OVERLAY_VISIBLE` is set.
+//!
+//! In gameplay the game holds the mouse in exclusive mode, which freezes the Windows cursor and stops mouse
+//! messages from reaching the overlay (the pause menu doesn't, which is why the overlay worked there). So
+//! while the overlay is open each device is also unacquired, and re-acquired on the first read after it closes.
 
 use std::ffi::c_void;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{E_FAIL, HMODULE};
+use windows::Win32::Foundation::{E_FAIL, HMODULE, S_OK};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READWRITE, VirtualProtect};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
@@ -22,6 +26,8 @@ type GetDeviceDataFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, 
 
 /// COM vtable slots: IDirectInput8::CreateDevice, IDirectInputDevice8::GetDeviceState / GetDeviceData.
 const SLOT_CREATE_DEVICE: usize = 3;
+const SLOT_ACQUIRE: usize = 7;
+const SLOT_UNACQUIRE: usize = 8;
 const SLOT_GET_DEVICE_STATE: usize = 9;
 const SLOT_GET_DEVICE_DATA: usize = 10;
 
@@ -66,24 +72,62 @@ fn vtable_of(obj: *mut c_void) -> usize {
     unsafe { obj.cast::<usize>().as_ref().copied().unwrap_or(0) }
 }
 
+/// Devices (by object address) unacquired here while the overlay was open.
+static RELEASED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Calls `Acquire` or `Unacquire` (both `HRESULT (this)`) through the device's own vtable.
+unsafe fn call_slot(dev: *mut c_void, slot: usize) {
+    unsafe {
+        let Some(vtable) = dev.cast::<*const usize>().as_ref().copied().filter(|v| !v.is_null()) else { return };
+        let f = vtable.add(slot).read();
+        if f != 0 {
+            let _ = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> HRESULT>(f)(dev);
+        }
+    }
+}
+
+/// Called before each read. While the overlay is open, unacquires the device (an exclusive-mode mouse
+/// otherwise freezes the cursor and swallows mouse messages) and returns true. After it closes,
+/// re-acquires the devices released here.
+fn overlay_holds(dev: *mut c_void) -> bool {
+    let visible = crate::state::OVERLAY_VISIBLE.load(Relaxed);
+    let Ok(mut rel) = RELEASED.lock() else { return visible };
+    let i = rel.iter().position(|&d| d == dev as usize);
+    if visible {
+        // Every call, in case the game re-acquired it meanwhile (a no-op when already unacquired).
+        unsafe { call_slot(dev, SLOT_UNACQUIRE) };
+        if i.is_none() {
+            rel.push(dev as usize);
+        }
+    } else if let Some(i) = i {
+        rel.swap_remove(i);
+        unsafe { call_slot(dev, SLOT_ACQUIRE) };
+    }
+    visible
+}
+
 unsafe extern "system" fn get_device_state(this: *mut c_void, size: u32, data: *mut c_void) -> HRESULT {
     let vt = vtable_of(this);
     let Some(orig) = DEVICE.lock().ok().and_then(|d| d.iter().find(|e| e.0 == vt).map(|e| e.1)) else { return E_FAIL };
-    let hr = unsafe { orig(this, size, data) };
-    if hr.is_ok() && crate::state::OVERLAY_VISIBLE.load(Relaxed) && !data.is_null() {
-        unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+    if overlay_holds(this) {
+        if !data.is_null() {
+            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+        }
+        return S_OK;
     }
-    hr
+    unsafe { orig(this, size, data) }
 }
 
 unsafe extern "system" fn get_device_data(this: *mut c_void, size: u32, data: *mut c_void, count: *mut u32, flags: u32) -> HRESULT {
     let vt = vtable_of(this);
     let Some(orig) = DEVICE.lock().ok().and_then(|d| d.iter().find(|e| e.0 == vt).map(|e| e.2)) else { return E_FAIL };
-    let hr = unsafe { orig(this, size, data, count, flags) };
-    if hr.is_ok() && crate::state::OVERLAY_VISIBLE.load(Relaxed) && !count.is_null() {
-        unsafe { *count = 0 }; // the buffered events were consumed, so they don't fire after closing
+    if overlay_holds(this) {
+        if !count.is_null() {
+            unsafe { *count = 0 };
+        }
+        return S_OK;
     }
-    hr
+    unsafe { orig(this, size, data, count, flags) }
 }
 
 unsafe extern "system" fn create_device(this: *mut c_void, guid: *const c_void, out: *mut *mut c_void, outer: *mut c_void) -> HRESULT {
